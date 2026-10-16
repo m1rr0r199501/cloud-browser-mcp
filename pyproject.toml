@@ -1,0 +1,43 @@
+[project]
+name = "cbmcp"
+version = "0.1.0"
+description = "Multi-tenant cloud-browser MCP gateway for agent swarms (Browser Use Cloud)"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=2.0.0",
+    "playwright>=1.49.0",
+    "httpx>=0.27.0",
+    "pydantic>=2.7.0",
+    "pydantic-settings>=2.3.0",
+    "aiosqlite>=0.20.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+cbmcp = "cbmcp.cli:main"
+cbmcp-server = "cbmcp.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cbmcp"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["B008", "E501"]
