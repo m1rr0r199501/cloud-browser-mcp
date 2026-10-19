@@ -187,7 +187,9 @@ async def run(args: argparse.Namespace) -> int:
         }
     )
     params = StdioServerParameters(
-        command=str(ROOT / ".venv/bin/python"),
+        # The interpreter running this script, so it works from any venv
+        # layout (uv, venv, pyenv) rather than only ./.venv/bin/python.
+        command=sys.executable,
         args=["-m", "cbmcp.server"],
         cwd=str(ROOT),
         env=env,

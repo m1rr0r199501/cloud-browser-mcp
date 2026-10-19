@@ -12,6 +12,10 @@ from ._common import guarded
 
 ACQUIRE_DOC = """Rent a cloud browser for this task. Returns a lease token.
 
+Use this whenever a task needs a real web browser: opening or operating a
+website, logging in, filling in forms, clicking through a flow, screenshots,
+downloads, or inspecting network traffic / JavaScript.
+
 Browsers are created on demand and cost money for every second they run, so:
   - call this ONLY when HTTP requests are not enough (you need JavaScript
     execution, dynamic rendering, a login flow, or network/JS debugging);

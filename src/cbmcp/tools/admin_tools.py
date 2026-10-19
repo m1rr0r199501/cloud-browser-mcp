@@ -147,6 +147,16 @@ def register(mcp: MCPServer) -> None:
         if action == "stop":
             if not platform_session_id:
                 raise InvalidArgument("action='stop' needs platform_session_id")
+            # Agents call this tool, and an agent can be steered by the pages it
+            # reads. Limit it to sessions this deployment created; anything else
+            # on the account is the operator's call (`cbmcp stop <id>`).
+            target = await app.PR.get_session(platform_session_id)
+            if target is not None and target.metadata.get("cbmcp_owner") != app.s.owner_tag:
+                raise InvalidArgument(
+                    f"session {platform_session_id!r} was not created by this deployment",
+                    hint="Use the operator CLI (`python -m cbmcp.cli stop <id>`) for "
+                    "sessions this gateway does not own.",
+                )
             stopped = await app.PR.stop_session(platform_session_id)
             await app.store.upsert_platform_session(
                 platform_session_id=platform_session_id,

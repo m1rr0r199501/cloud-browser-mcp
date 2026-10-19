@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import socket
 import uuid
@@ -20,6 +21,36 @@ def _default_data_dir() -> Path:
     base = os.environ.get("XDG_STATE_HOME")
     root = Path(base) if base else Path.home() / ".local" / "state"
     return root / "cbmcp"
+
+
+def _host_label() -> str:
+    raw = socket.gethostname().split(".")[0][:40] or "host"
+    return "".join(c if c.isalnum() or c in "-_" else "-" for c in raw)
+
+
+def _stable_owner_tag(data_dir: Path) -> str:
+    """The default owner tag, fixed on first run and then read back.
+
+    It used to be derived from the hostname on every start. On a Mac the
+    hostname follows the network (``MacBook-Pro`` at home, ``mbp-1234`` on
+    office DHCP), so the tag silently changed and reconciliation stopped
+    recognising sessions this machine had left running. The first value is now
+    written to the data dir and reused, so it survives network changes.
+    """
+    path = data_dir / "owner_tag"
+    try:
+        existing = path.read_text("utf-8").strip()
+        if existing:
+            return existing
+    except OSError:
+        pass
+    tag = f"cbmcp-{_host_label()}"
+    try:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        path.write_text(tag + "\n", "utf-8")
+    except OSError:
+        pass  # read-only data dir: fall back to the hostname-derived tag
+    return tag
 
 
 def _project_root() -> Path:
@@ -65,6 +96,11 @@ class Settings(BaseSettings):
     acquire_block_seconds: float = Field(default=25.0, ge=0.0, le=120.0)
     queue_timeout_seconds: float = Field(default=600.0, ge=5.0)
     respect_platform_limit: bool = True
+    # Every Claude Code window starts its own gateway. With this on (the
+    # default), max_concurrency is one ceiling shared by all gateways on this
+    # data dir rather than a separate ceiling per window, so three windows do
+    # not try to run 3x the browsers the account allows.
+    share_concurrency_across_gateways: bool = True
 
     # --- lease lifecycle ---------------------------------------------------
     idle_timeout_seconds: float = Field(default=300.0, ge=15.0)
@@ -119,6 +155,9 @@ class Settings(BaseSettings):
     pdf_renderer_enabled: bool = True
     enable_recording: bool = False
     capture_bodies: CaptureBodies = "interesting"
+    # How alert/confirm/prompt dialogs are answered until page_dialog changes
+    # it. "dismiss" never confirms anything the agent did not ask to confirm.
+    dialog_default: Literal["dismiss", "accept"] = "dismiss"
     default_timeout_ms: int = Field(default=15_000, ge=500)
     navigation_timeout_ms: int = Field(default=45_000, ge=1000)
 
@@ -132,6 +171,11 @@ class Settings(BaseSettings):
 
     # --- infra -------------------------------------------------------------
     data_dir: Path = Field(default_factory=_default_data_dir)
+    # page_upload may only send files from under this directory (default:
+    # <data_dir>/uploads). The tool is driven by an agent that reads untrusted
+    # pages, so without a root a prompt injection could have it upload
+    # ~/.ssh/id_ed25519 or a Keychain export to an attacker's form.
+    upload_dir: Path | None = None
     log_level: str = "INFO"
     instance_id: str = Field(default_factory=lambda: uuid.uuid4().hex[:12])
 
@@ -147,7 +191,15 @@ class Settings(BaseSettings):
     def _blank_data_dir(cls, v: object) -> object:
         if v in (None, ""):
             return _default_data_dir()
-        return v
+        # "~/..." in .env is not expanded by the shell, so do it here.
+        return Path(str(v)).expanduser()
+
+    @field_validator("upload_dir", mode="before")
+    @classmethod
+    def _blank_upload_dir(cls, v: object) -> object:
+        if v in (None, ""):
+            return None
+        return Path(str(v)).expanduser()
 
     @field_validator("custom_proxy_port", mode="before")
     @classmethod
@@ -164,8 +216,11 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def _finish(self) -> Settings:
         if not self.owner_tag:
-            host = socket.gethostname().split(".")[0][:40]
-            object.__setattr__(self, "owner_tag", f"cbmcp-{host}")
+            object.__setattr__(self, "owner_tag", _stable_owner_tag(self.data_dir))
+        # The platform caps its hard stop at 240 minutes, so a longer lease
+        # could never be backed by it; cap the lease instead.
+        if self.max_lease_seconds > (240 - 2) * 60:
+            object.__setattr__(self, "max_lease_seconds", float((240 - 2) * 60))
         # The platform hard stop must outlive the lease we hand out, otherwise the
         # browser dies under the agent's feet mid-task.
         min_platform = int(self.max_lease_seconds // 60) + 2
@@ -191,12 +246,27 @@ class Settings(BaseSettings):
         return self.data_dir / "artifacts"
 
     @property
+    def heartbeat_max_age_seconds(self) -> float:
+        """A sibling gateway silent for longer than this is presumed dead."""
+        return max(60.0, self.reaper_interval_seconds * 4)
+
+    @property
+    def uploads_dir(self) -> Path:
+        return self.upload_dir or (self.data_dir / "uploads")
+
+    @property
     def price_browser_usd_per_second(self) -> float:
         return self.price_browser_usd_per_hour / 3600.0
 
     def ensure_dirs(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.artifacts_dir.mkdir(parents=True, exist_ok=True)
+        self.uploads_dir.mkdir(parents=True, exist_ok=True)
+        # Captured bodies, cookies and hook records land here; keep them
+        # private to this user (the default umask leaves them world-readable).
+        if os.name == "posix":
+            with contextlib.suppress(OSError):
+                self.artifacts_dir.chmod(0o700)
 
     def redacted(self) -> dict[str, object]:
         data = self.model_dump(mode="json")

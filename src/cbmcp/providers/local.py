@@ -20,6 +20,7 @@ import contextlib
 import os
 import re
 import shutil
+import sys
 import tempfile
 import time
 import uuid
@@ -44,12 +45,29 @@ class _Local:
     timeout_at: float
     metadata: dict[str, str] = field(default_factory=dict)
     stopped_at: float | None = None
+    tasks: list[asyncio.Task] = field(default_factory=list)
+
+
+_MAC_APPS = (
+    "Google Chrome.app/Contents/MacOS/Google Chrome",
+    "Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+    "Chromium.app/Contents/MacOS/Chromium",
+    "Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+    "Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+    "Brave Browser.app/Contents/MacOS/Brave Browser",
+)
 
 
 def _find_chromium() -> str:
     env = os.environ.get("CBMCP_CHROMIUM_PATH")
-    if env and os.path.exists(env):
-        return env
+    if env:
+        env = os.path.expanduser(env)
+        if os.path.isdir(env) and env.endswith(".app"):
+            # Accept the .app bundle itself, which is what Finder shows.
+            name = os.path.basename(env)[: -len(".app")]
+            env = os.path.join(env, "Contents", "MacOS", name)
+        if os.path.exists(env):
+            return env
     try:  # Playwright's bundled Chromium is the best default when present
         from playwright.sync_api import sync_playwright
 
@@ -59,13 +77,12 @@ def _find_chromium() -> str:
                 return path
     except Exception:  # noqa: BLE001 - fall through to system browsers
         pass
-    for candidate in (
-        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-        "/Applications/Chromium.app/Contents/MacOS/Chromium",
-        "google-chrome",
-        "chromium",
-        "chromium-browser",
-    ):
+    candidates: list[str] = []
+    if sys.platform == "darwin":
+        for root in ("/Applications", os.path.expanduser("~/Applications")):
+            candidates.extend(os.path.join(root, app) for app in _MAC_APPS)
+    candidates += ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser"]
+    for candidate in candidates:
         found = shutil.which(candidate) if "/" not in candidate else candidate
         if found and os.path.exists(found):
             return found
@@ -91,6 +108,16 @@ class LocalChromiumProvider:
             await self.stop_session(sid)
 
     async def create_session(self, spec: SessionSpec) -> ProviderSession:
+        proxy = spec.network.custom if spec.network.kind == "custom_proxy" else None
+        if proxy is not None and proxy.username:
+            # Chromium cannot do proxy auth from the command line, and it
+            # cannot do authenticated SOCKS5 at all. Say so loudly -- and before
+            # anything is created that would then need cleaning up.
+            raise ProviderError(
+                "the local provider cannot supply proxy credentials",
+                hint="Use provider=browseruse for authenticated proxies, "
+                "or point CBMCP_CUSTOM_PROXY_HOST at a local unauthenticated relay.",
+            )
         if self._binary is None:
             self._binary = await asyncio.to_thread(_find_chromium)
         user_data_dir = tempfile.mkdtemp(prefix="cbmcp-chrome-")
@@ -105,29 +132,36 @@ class LocalChromiumProvider:
             "--disable-renderer-backgrounding",
             "--disable-features=Translate,MediaRouter,OptimizationHints",
             f"--window-size={spec.screen_width or 1440},{spec.screen_height or 900}",
-            "about:blank",
         ]
+        if sys.platform == "darwin":
+            # A fresh profile otherwise asks the macOS Keychain for "Chrome Safe
+            # Storage", which pops a password dialog that blocks an unattended
+            # launch. Playwright passes the same flag for the same reason.
+            args.append("--use-mock-keychain")
+        elif sys.platform.startswith("linux"):
+            args.append("--password-store=basic")
         if self._headless:
-            args.insert(1, "--headless=new")
-        if spec.network.kind == "custom_proxy" and spec.network.custom:
-            proxy = spec.network.custom
-            args.insert(1, f"--proxy-server={proxy.host}:{proxy.port}")
-            if proxy.username:
-                # Chromium cannot do proxy auth from the command line, and it
-                # cannot do authenticated SOCKS5 at all. Say so loudly.
-                raise ProviderError(
-                    "the local provider cannot supply proxy credentials",
-                    hint="Use provider=browseruse for authenticated proxies, "
-                    "or point CBMCP_CUSTOM_PROXY_HOST at a local unauthenticated relay.",
-                )
+            args.append("--headless=new")
+        if proxy is not None:
+            args.append(f"--proxy-server={proxy.host}:{proxy.port}")
+        args.append("about:blank")
 
-        proc = await asyncio.create_subprocess_exec(
-            *args, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
-        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *args, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
+            )
+        except OSError as exc:
+            shutil.rmtree(user_data_dir, ignore_errors=True)
+            raise ProviderError(
+                f"could not launch local Chromium at {self._binary!r}: {exc.strerror or exc}",
+                hint="Set CBMCP_CHROMIUM_PATH to a Chrome/Chromium executable.",
+            ) from exc
         cdp_url = await self._read_ws_endpoint(proc)
         if not cdp_url:
             with contextlib.suppress(ProcessLookupError):
                 proc.kill()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(proc.wait(), timeout=5.0)
             shutil.rmtree(user_data_dir, ignore_errors=True)
             raise ProviderError("local Chromium did not report a DevTools endpoint")
 
@@ -146,10 +180,24 @@ class LocalChromiumProvider:
         # Enforce the platform-side hard timeout locally too, so reaper tests
         # exercise the same code path as the cloud.
         timer = asyncio.create_task(self._hard_timeout(sid, spec.timeout_minutes * 60))
-        self._bg.add(timer)
-        timer.add_done_callback(self._bg.discard)
+        # Chromium keeps writing to stderr for its whole life. Nobody reading
+        # the pipe means it eventually fills (16-64 KB; small on macOS) and
+        # Chromium blocks mid-write -- a browser that hangs for no visible reason.
+        drain = asyncio.create_task(self._drain(proc))
+        for task in (timer, drain):
+            self._bg.add(task)
+            task.add_done_callback(self._bg.discard)
+            entry.tasks.append(task)
         log.info("local chromium session %s up", sid)
         return self._view(entry)
+
+    @staticmethod
+    async def _drain(proc: asyncio.subprocess.Process) -> None:
+        if proc.stderr is None:
+            return
+        with contextlib.suppress(Exception):
+            while await proc.stderr.read(65536):
+                pass
 
     async def _read_ws_endpoint(self, proc: asyncio.subprocess.Process) -> str | None:
         assert proc.stderr is not None
@@ -204,6 +252,10 @@ class LocalChromiumProvider:
         if entry is None:
             return True
         entry.stopped_at = time.time()
+        current = asyncio.current_task()
+        for task in entry.tasks:
+            if task is not current and not task.done():
+                task.cancel()
         proc = entry.process
         if proc.returncode is None:
             with contextlib.suppress(ProcessLookupError):

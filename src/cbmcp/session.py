@@ -37,8 +37,11 @@ import base64
 import contextlib
 import json
 import time
+import urllib.parse
+from collections import deque
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from playwright.async_api import Browser, BrowserContext, Page, Playwright
 from playwright.async_api import Error as PwError
@@ -52,6 +55,7 @@ from .errors import (
     InvalidArgument,
     NotFound,
     RefNotFound,
+    ScopeViolation,
     ToolTimeout,
 )
 from .hooks import DRAIN_JS, RUNTIME_JS, STATUS_JS, HookRegistry, new_hook_namespace
@@ -169,6 +173,22 @@ class BrowserSession:
         self.connected = False
         self._artifact_seq = 0
         self._init_script_installed = False
+        self._hook_init_script: Any | None = None
+        # What to do with alert/confirm/prompt/beforeunload. A person clicks OK
+        # on "Are you sure?"; dismissing everything made such flows impossible.
+        # The default stays "dismiss" (never confirm something unasked), and
+        # page_dialog switches it, once or until changed.
+        self.dialog_policy: dict[str, Any] = {
+            "action": settings.dialog_default,
+            "prompt_text": None,
+            "once": False,
+        }
+        self.dialogs: deque[dict[str, Any]] = deque(maxlen=50)
+        # Files the page downloaded, saved on this host.
+        self.downloads: list[dict[str, Any]] = []
+        self._download_seq = 0
+        # Tabs/popups opened by the page since the last tool call reported them.
+        self._new_pages: list[str] = []
         self.liveness_failures = 0
         # Strong references to fire-and-forget tasks. The event loop only keeps
         # weak ones, so a task nobody holds can be collected mid-execution --
@@ -280,11 +300,15 @@ class BrowserSession:
         self.pages[page_id] = handle
         if self._active_page_id is None:
             self._active_page_id = page_id
+        if self.connected:
+            # Opened after connect: a popup, target=_blank link or window.open.
+            self._new_pages.append(page_id)
 
         page.on("console", lambda msg: self._on_console(handle, msg))
         page.on("pageerror", lambda err: self._on_page_error(handle, err))
         page.on("close", lambda _p=None: self._on_page_closed(handle))
-        page.on("dialog", lambda dialog: self._spawn(self._on_dialog(dialog)))
+        page.on("dialog", lambda dialog: self._spawn(self._on_dialog(handle, dialog)))
+        page.on("download", lambda download: self._spawn(self._on_download(handle, download)))
         page.on("framenavigated", lambda frame: self._on_frame_navigated(handle, frame))
         self.netlog.attach_page(page)
 
@@ -437,22 +461,155 @@ class BrowserSession:
                 (h.id for h in self.pages.values() if not h.closed), None
             )
 
-    async def _on_dialog(self, dialog: Any) -> None:
+    async def _on_dialog(self, handle: PageHandle, dialog: Any) -> None:
         # An unhandled dialog blocks the page forever, which would look like a
-        # hung browser and burn the whole lease. Dismiss and record it.
+        # hung browser and burn the whole lease. So every dialog is answered at
+        # once, the way page_dialog says to (dismiss by default), and recorded.
         kind, message = dialog.type, dialog.message
-        with contextlib.suppress(PwError):
-            await dialog.dismiss()
-        for handle in self.pages.values():
-            handle.console.append(
-                {
-                    "ts": time.time(),
-                    "page": handle.id,
-                    "type": "dialog",
-                    "text": f"auto-dismissed {kind}: {message[:300]}",
-                }
-            )
-            break
+        policy = self.dialog_policy
+        action = policy["action"]
+        text = policy.get("prompt_text")
+        try:
+            if action == "accept":
+                if kind == "prompt" and text is not None:
+                    await dialog.accept(str(text))
+                else:
+                    await dialog.accept()
+            else:
+                await dialog.dismiss()
+            outcome = "accepted" if action == "accept" else "dismissed"
+        except PwError as exc:
+            outcome = f"error: {_clean(exc)}"
+        if policy.get("once"):
+            self.dialog_policy = {
+                "action": self.s.dialog_default,
+                "prompt_text": None,
+                "once": False,
+            }
+        record = {
+            "ts": time.time(),
+            "page": handle.id,
+            "type": kind,
+            "message": message[:1000],
+            "default_value": getattr(dialog, "default_value", "") or None,
+            "handled": outcome,
+            "prompt_text": text if action == "accept" and kind == "prompt" else None,
+        }
+        self.dialogs.append(record)
+        handle.console.append(
+            {
+                "ts": record["ts"],
+                "page": handle.id,
+                "type": "dialog",
+                "text": f"{outcome} {kind}: {message[:300]}",
+            }
+        )
+
+    async def _on_download(self, handle: PageHandle, download: Any) -> None:
+        """Save a file the page downloaded, the way a person's browser would.
+
+        ``save_as`` works for a local browser. A cloud browser writes the file
+        to its own disk and ``save_as`` hands back an empty file, so the bytes
+        are then fetched another way (see ``_fetch_download_bytes``).
+        """
+        self._download_seq += 1
+        download_id = f"d{self._download_seq}"
+        suggested = getattr(download, "suggested_filename", "") or "download"
+        target = self.dir / "downloads" / f"{download_id}-{_safe_filename(suggested)}"
+        entry: dict[str, Any] = {
+            "id": download_id,
+            "page": handle.id,
+            "url": download.url,
+            "filename": suggested,
+            "status": "in_progress",
+            "path": None,
+            "bytes": None,
+            "started_at": time.time(),
+        }
+        self.downloads.append(entry)
+        del self.downloads[:-100]
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+        problem = ""
+        try:
+            async with asyncio.timeout(300):
+                await download.save_as(target)
+            size = target.stat().st_size
+            if size > 0:
+                entry.update(status="saved", path=str(target), bytes=size)
+                return
+            # Measured against Browser Use Cloud: save_as "succeeds" but the
+            # file is empty, because the browser wrote it to the cloud
+            # machine's disk. Treat that as a miss and fetch the bytes below.
+            problem = "the browser saved it on its own (remote) disk"
+        except Exception as exc:  # noqa: BLE001 - fall back below
+            problem = _clean(exc)
+
+        url = download.url or ""
+        try:
+            data, via = await self._fetch_download_bytes(handle, url)
+        except _DownloadUnavailable as exc:
+            entry.update(status="failed", error=f"{problem}; {exc}"[:300])
+            return
+        except ScopeViolation as exc:
+            entry.update(status="blocked", error=exc.message)
+            return
+        await asyncio.to_thread(target.write_bytes, data)
+        entry.update(status="saved", path=str(target), bytes=len(data), via=via)
+
+    async def _fetch_download_bytes(self, handle: PageHandle, url: str) -> tuple[bytes, str]:
+        """Get a download's bytes when the browser kept the file to itself.
+
+        * ``data:``  -- decoded right here;
+        * ``blob:``  -- read inside the page that created it (typical for
+          client-side "Export CSV/PDF" buttons), if it has not been revoked;
+        * ``http(s):`` -- re-requested with this browser's cookies. A one-time
+          link, or a download produced by a POST, cannot be repeated this way.
+        """
+        if url.startswith("data:"):
+            header, _, payload = url.partition(",")
+            if header.endswith(";base64"):
+                return base64.b64decode(payload), "data_url"
+            return urllib.parse.unquote_to_bytes(payload), "data_url"
+
+        if url.startswith("blob:"):
+            try:
+                async with asyncio.timeout(60):
+                    result = await handle.page.evaluate(_READ_BLOB_JS, [url, 50 * 1024 * 1024])
+            except (PwError, TimeoutError) as exc:
+                raise _DownloadUnavailable(f"could not read the blob: {_clean(exc)}") from exc
+            if not isinstance(result, dict) or result.get("error"):
+                raise _DownloadUnavailable(
+                    "the page already revoked the blob URL"
+                    if not isinstance(result, dict)
+                    else str(result["error"])[:200]
+                )
+            return base64.b64decode(result["b64"]), "page_blob"
+
+        if url.startswith(("http://", "https://")) and self.context is not None:
+            self.scope.enforce(url)
+            try:
+                response = await self.context.request.get(url, timeout=120_000)
+            except Exception as exc:  # noqa: BLE001
+                raise _DownloadUnavailable(f"re-fetch failed: {_clean(exc)}") from exc
+            if not response.ok:
+                raise _DownloadUnavailable(f"re-fetch returned HTTP {response.status}")
+            return await response.body(), "refetch_with_cookies"
+
+        raise _DownloadUnavailable(f"no way to retrieve a {url.split(':', 1)[0]}: download")
+
+    def take_new_dialogs(self) -> list[dict[str, Any]]:
+        """Dialogs answered since the last call, so a tool can say what popped up."""
+        fresh = [d for d in self.dialogs if not d.get("_reported")]
+        for record in fresh:
+            record["_reported"] = True
+        return [{k: v for k, v in d.items() if not k.startswith("_")} for d in fresh]
+
+    def take_new_pages(self) -> list[str]:
+        """Tabs the page opened by itself since the last call, then forget them."""
+        opened = [p for p in self._new_pages if p in self.pages and not self.pages[p].closed]
+        self._new_pages.clear()
+        return opened
 
     def _on_frame_navigated(self, handle: PageHandle, frame: Any) -> None:
         # Navigation resets Debugger.setSkipAllPauses, which would let a page's
@@ -493,10 +650,24 @@ class BrowserSession:
             )
         return handle
 
-    def select(self, page_id: str) -> PageHandle:
+    async def select(self, page_id: str) -> PageHandle:
+        """Switch tabs the way a person does: the tab comes to the front.
+
+        Only moving our pointer left the tab in the background, where Chromium
+        stops painting it (screenshots hang until timeout) and throttles its
+        timers and animations.
+        """
         handle = self.handle(page_id)
         self._active_page_id = handle.id
+        await self.bring_to_front(handle)
         return handle
+
+    async def bring_to_front(self, handle: PageHandle) -> None:
+        if handle.debugger is not None and handle.debugger.is_paused:
+            return
+        with contextlib.suppress(PwError, TimeoutError):
+            async with asyncio.timeout(5):
+                await handle.page.bring_to_front()
 
     def ensure_runnable(self, handle: PageHandle) -> None:
         """Refuse page operations while the debugger has the renderer stopped."""
@@ -511,6 +682,9 @@ class BrowserSession:
         page = await self.context.new_page()
         handle = await self._adopt(page)
         self._active_page_id = handle.id
+        # The agent asked for this tab, so it is not news to report later.
+        with contextlib.suppress(ValueError):
+            self._new_pages.remove(handle.id)
         return handle
 
     async def close_page(self, page_id: str) -> None:
@@ -631,8 +805,10 @@ class BrowserSession:
                 evaluated = await handle.cdp.send(
                     "Runtime.evaluate",
                     {
+                        # json.dumps, not repr: a Python repr is not always a
+                        # valid JS string literal.
                         "expression": (
-                            f"document.querySelector({ref_selector(ref, self.ref_attr)!r})"
+                            f"document.querySelector({json.dumps(ref_selector(ref, self.ref_attr))})"
                         ),
                         "returnByValue": False,
                     },
@@ -711,24 +887,37 @@ class BrowserSession:
         max_bytes: int | None = None,
     ) -> dict[str, Any]:
         self.ensure_runnable(handle)
+        if sum(1 for h in self.pages.values() if not h.closed) > 1:
+            # A background tab is not painted, so capturing it would hang.
+            await self.bring_to_front(handle)
         self._artifact_seq += 1
         ext = "jpg" if self.s.screenshot_format == "jpeg" else "png"
         path = self.dir / f"shot{self._artifact_seq}.{ext}"
-        options: dict[str, Any] = {"full_page": full_page, "timeout": 30_000}
+        # scale="css": one image pixel is one CSS pixel, so a point read off the
+        # screenshot is exactly what page_mouse(x, y) clicks, on HiDPI too.
+        options: dict[str, Any] = {"timeout": 30_000, "scale": "css"}
         if self.s.screenshot_format == "jpeg":
             options["type"] = "jpeg"
             options["quality"] = self.s.screenshot_quality
         try:
             if ref:
                 locator = await self.resolve_ref(handle, ref)
-                data = await locator.screenshot(timeout=30_000)
+                # Same type as the page path: this used to fall back to PNG while
+                # the result still claimed JPEG.
+                data = await locator.screenshot(**options)
             else:
-                data = await handle.page.screenshot(**options)
+                data = await handle.page.screenshot(full_page=full_page, **options)
         except (PwError, TimeoutError) as exc:
             raise ToolTimeout(f"screenshot failed: {_clean(exc)}") from exc
 
         await asyncio.to_thread(path.write_bytes, data)
         limit = max_bytes or self.s.max_screenshot_bytes
+        viewport = handle.page.viewport_size
+        if viewport is None:
+            with contextlib.suppress(PwError):
+                viewport = await handle.page.evaluate(
+                    "({width: innerWidth, height: innerHeight})"
+                )
         return {
             "path": str(path),
             "bytes": len(data),
@@ -736,6 +925,12 @@ class BrowserSession:
             "too_large_to_inline": len(data) > limit,
             "data": data,
             "url": handle.page.url,
+            "viewport": viewport,
+            "coordinates": (
+                "CSS pixels; page_mouse(x, y) uses the same frame"
+                if not (ref or full_page)
+                else "element/full-page capture: offsets differ from viewport coordinates"
+            ),
         }
 
     async def emulate(
@@ -753,6 +948,7 @@ class BrowserSession:
         viewport_width: int | None = None,
         viewport_height: int | None = None,
         dark_mode: bool | None = None,
+        grant_permissions: list[str] | None = None,
     ) -> dict[str, Any]:
         """Change the conditions the page runs under.
 
@@ -801,6 +997,27 @@ class BrowserSession:
             await attempt(
                 "network", "Network.emulateNetworkConditions", conditions, network
             )
+
+        if grant_permissions is not None:
+            # What a person does by clicking "Allow" on a permission prompt.
+            # An empty list revokes everything granted so far.
+            try:
+                if self.context is None:
+                    raise BrowserConnectionError("not connected")
+                if grant_permissions:
+                    parts = urlsplit(handle.page.url)
+                    origin = (
+                        f"{parts.scheme}://{parts.netloc}"
+                        if parts.scheme in ("http", "https")
+                        else None
+                    )
+                    await self.context.grant_permissions(grant_permissions, origin=origin)
+                    applied["permissions"] = {"granted": grant_permissions, "origin": origin}
+                else:
+                    await self.context.clear_permissions()
+                    applied["permissions"] = "cleared"
+            except Exception as exc:  # noqa: BLE001 - report, never abort the batch
+                failed["permissions"] = str(exc)[:150]
 
         if latitude is not None and longitude is not None:
             await attempt(
@@ -885,14 +1102,42 @@ class BrowserSession:
 
     # ----- hooks -----------------------------------------------------------
 
+    async def sync_hook_init_script(self) -> bool:
+        """Make the init script that runs on future documents match the hook set.
+
+        Each js_hook call used to add one more init script and none were ever
+        removed, so a removed or cleared hook kept being installed on every
+        later page load. Returns False when this Playwright version cannot
+        remove an init script (``add_init_script`` returning a Disposable is
+        recent), in which case removed hooks persist until the lease ends.
+        """
+        if self.context is None:
+            raise BrowserConnectionError("not connected")
+        previous = self._hook_init_script
+        self._hook_init_script = None
+        if self.hooks.specs:
+            # Add the new one before dropping the old, so no document loads
+            # in between without the runtime.
+            self._hook_init_script = await self.context.add_init_script(
+                self.hooks.install_script()
+            )
+            self._init_script_installed = True
+        if previous is None:
+            return True
+        dispose = getattr(previous, "dispose", None)
+        if dispose is None:
+            return False
+        with contextlib.suppress(PwError):
+            await dispose()
+        return True
+
     async def apply_hooks(self) -> dict[str, Any]:
         """Install the current hook set into the context and all open pages."""
         if self.context is None:
             raise BrowserConnectionError("not connected")
         upgrade = await self.ensure_debug("hooks")
         # Future documents: the runtime must be present before page scripts run.
-        await self.context.add_init_script(self.hooks.install_script())
-        self._init_script_installed = True
+        await self.sync_hook_init_script()
         payload = self.hooks.install_payload()
 
         # break_on_match works by injecting `debugger;`, which does nothing while
@@ -1193,9 +1438,12 @@ class BrowserSession:
 
 ENVIRONMENT_JS = r"""
 () => {
-  const take = (store) => {
+  // Takes a getter: merely *reading* window.localStorage throws a
+  // SecurityError on opaque origins (data: URLs, sandboxed frames).
+  const take = (getStore) => {
     const out = {};
     try {
+      const store = getStore();
       for (let i = 0; i < Math.min(store.length, 100); i++) {
         const k = store.key(i);
         out[k] = String(store.getItem(k) || '').slice(0, 2000);
@@ -1228,8 +1476,8 @@ ENVIRONMENT_JS = r"""
     window: { innerWidth: window.innerWidth, innerHeight: window.innerHeight },
     timezone: tz,
     timezone_offset_minutes: tzOffset,
-    local_storage: take(window.localStorage),
-    session_storage: take(window.sessionStorage),
+    local_storage: take(() => window.localStorage),
+    session_storage: take(() => window.sessionStorage),
   };
 }
 """
@@ -1257,23 +1505,29 @@ const storage = (data) => ({
   get length() { return Object.keys(this._d).length; },
 });
 
-global.navigator = { ...env.navigator };
-global.screen = { ...env.screen };
-global.location = new URL(env.url);
-global.document = {
+// Node 21+ ships its own getter-only `navigator` (userAgent "Node.js/22"...),
+// and plain assignment to it is silently ignored. defineProperty replaces it,
+// so the reimplementation really sees the captured browser values.
+const stub = (name, value) => Object.defineProperty(globalThis, name, {
+  value, writable: true, configurable: true, enumerable: true,
+});
+stub('navigator', { ...env.navigator });
+stub('screen', { ...env.screen });
+stub('location', new URL(env.url));
+stub('document', {
   referrer: env.referrer || '',
   cookie: (env.cookies || []).map((c) => `${c.name}=${c.value}`).join('; '),
   createElement: () => ({ style: {}, setAttribute() {}, appendChild() {} }),
   querySelector: () => null,
   querySelectorAll: () => [],
-};
-global.localStorage = storage(env.local_storage);
-global.sessionStorage = storage(env.session_storage);
-global.window = global;
-global.self = global;
-global.top = global;
-global.btoa = (s) => Buffer.from(s, 'binary').toString('base64');
-global.atob = (s) => Buffer.from(s, 'base64').toString('binary');
+});
+stub('localStorage', storage(env.local_storage));
+stub('sessionStorage', storage(env.session_storage));
+stub('window', globalThis);
+stub('self', globalThis);
+stub('top', globalThis);
+stub('btoa', (s) => Buffer.from(s, 'binary').toString('base64'));
+stub('atob', (s) => Buffer.from(s, 'base64').toString('binary'));
 
 // ---------------------------------------------------------------------------
 // PASTE THE EXTRACTED ALGORITHM HERE.
@@ -1325,6 +1579,34 @@ for (const [label, items] of Object.entries(byLabel)) {
 console.log(`\\n${pass} passed, ${fail} failed, ${skipped} unpaired`);
 process.exit(fail ? 1 : 0);
 '''
+
+
+class _DownloadUnavailable(Exception):
+    pass
+
+
+_READ_BLOB_JS = r"""
+async ([url, cap]) => {
+  try {
+    const blob = await (await fetch(url)).blob();
+    if (blob.size > cap) return { error: 'blob is ' + blob.size + ' bytes, over the cap' };
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    let bin = '';
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+      bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    }
+    return { b64: btoa(bin) };
+  } catch (e) {
+    return { error: 'blob unreadable (revoked by the page?): ' + String(e).slice(0, 150) };
+  }
+}
+"""
+
+
+def _safe_filename(name: str) -> str:
+    base = name.replace("\\", "/").split("/")[-1].strip() or "download"
+    cleaned = "".join(c if c.isalnum() or c in "-._ " else "_" for c in base)
+    return cleaned.lstrip(".")[:120] or "download"
 
 
 def _safe_name(url: str) -> str:

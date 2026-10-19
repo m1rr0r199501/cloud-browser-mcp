@@ -28,7 +28,7 @@ from typing import Any
 
 import httpx
 
-from ..errors import ProviderError, ProviderQuotaError
+from ..errors import ProviderConcurrencyLimit, ProviderError, ProviderQuotaError
 from ..log import get_logger
 from .base import AccountInfo, NetworkSpec, ProviderSession, SessionSpec
 
@@ -123,7 +123,7 @@ class BrowserUseProvider:
                 if isinstance(body, dict) and body.get("limit_rps"):
                     await asyncio.sleep(min(delay, 10.0))
                     continue
-                raise ProviderQuotaError(
+                raise ProviderConcurrencyLimit(
                     "Browser Use rejected the request: too many concurrent sessions",
                     retry_after_seconds=delay,
                 )
@@ -147,8 +147,9 @@ class BrowserUseProvider:
                 f"Browser Use refused: insufficient credits or monthly spend cap reached. {detail}"
             )
         if code == 429:
-            raise ProviderQuotaError(
-                f"Browser Use refused: concurrent session limit reached. {detail}"
+            raise ProviderConcurrencyLimit(
+                f"Browser Use refused: concurrent session limit reached. {detail}",
+                retry_after_seconds=_to_float(resp.headers.get("Retry-After")) or None,
             )
         if code == 401 or code == 403:
             raise ProviderError(
@@ -302,7 +303,11 @@ class BrowserUseProvider:
         data = await self._request("GET", "/api/v2/billing/account")
         if not isinstance(data, dict):
             return AccountInfo()
-        balance = data.get("creditBalance")
+        # The live API reports totalCreditsBalanceUsd (checked 2026-10);
+        # creditBalance is kept as a fallback for older responses.
+        balance = data.get("totalCreditsBalanceUsd")
+        if balance is None:
+            balance = data.get("creditBalance")
         if isinstance(balance, dict):
             balance = balance.get("usd") or balance.get("amount")
         return AccountInfo(

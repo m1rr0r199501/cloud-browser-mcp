@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -21,6 +22,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from cbmcp.app import App, set_app  # noqa: E402
 from cbmcp.pool import AcquireRequest  # noqa: E402
+
+
+def _find_node() -> Path | None:
+    """Playwright's bundled node (any Python version, any OS), else node on PATH."""
+    try:
+        import playwright
+
+        driver = Path(playwright.__file__).resolve().parent / "driver"
+        for name in ("node", "node.exe"):
+            if (driver / name).exists():
+                return driver / name
+    except ImportError:
+        pass
+    found = shutil.which("node")
+    return Path(found) if found else None
 
 URL = "https://bot.sannysoft.com/"
 results: list[tuple[str, bool, str]] = []
@@ -189,11 +205,8 @@ async def run() -> int:
                 f"ua={env['navigator']['userAgent'][:40]}... tz={env['timezone']}",
             )
             # The scaffold must actually run -- Playwright ships a node binary.
-            node = (
-                Path(sys.prefix)
-                / "lib/python3.12/site-packages/playwright/driver/node"
-            )
-            if node.exists():
+            node = _find_node()
+            if node is not None:
                 proc = subprocess.run(
                     [str(node), str(root / "rebuild.js")],
                     capture_output=True,

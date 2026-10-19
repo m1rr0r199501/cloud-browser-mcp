@@ -12,9 +12,13 @@ its SHA-256 -- so a leaked database cannot be used to drive someone's browser.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import os
+import random
 import secrets
+import sqlite3
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -116,6 +120,29 @@ CREATE TABLE IF NOT EXISTS counters (
     name                  TEXT PRIMARY KEY,
     value                 REAL NOT NULL DEFAULT 0
 );
+
+-- Liveness of gateway processes sharing this database. Every MCP client window
+-- (e.g. several Claude Code sessions on one Mac) starts its own gateway, all on
+-- the same default data dir, so "a lease from another instance" does NOT mean
+-- "a lease from a dead process". The heartbeat is what tells the two apart.
+CREATE TABLE IF NOT EXISTS instances (
+    instance_id           TEXT PRIMARY KEY,
+    pid                   INTEGER,
+    host                  TEXT,
+    started_at            REAL NOT NULL,
+    heartbeat_at          REAL NOT NULL
+);
+
+-- One row per browser slot held by any gateway on this data dir. Claiming is a
+-- single conditional INSERT, which SQLite serialises across processes, so two
+-- windows can never both take the last slot. (Counting leases instead let ten
+-- simultaneous requests from three windows all through a ceiling of six.)
+CREATE TABLE IF NOT EXISTS slot_claims (
+    claim_id              TEXT PRIMARY KEY,
+    instance_id           TEXT NOT NULL,
+    created_at            REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_claims_instance ON slot_claims(instance_id);
 """
 
 # Lease states. ACTIVE/CREATING/RELEASING/UNKNOWN all occupy a concurrency slot:
@@ -144,6 +171,50 @@ def new_lease_token() -> str:
 
 def token_hash(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
+
+
+def _pid_alive(pid: int) -> bool:
+    """Best-effort "is this process running" check.
+
+    Signal 0 probes without delivering anything on macOS and Linux. On Windows
+    ``os.kill`` would *terminate* the process, so the process table is asked
+    instead. When unsure, say alive and let the heartbeat age decide.
+    """
+    if pid <= 0 or pid == os.getpid():
+        return True
+    if os.name == "nt":
+        return _pid_alive_windows(pid)
+    if os.name != "posix":
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, owned by someone else
+    except OSError:
+        return True
+    return True
+
+
+def _pid_alive_windows(pid: int) -> bool:
+    try:
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+        if not handle:
+            # 5 = access denied: it exists but belongs to someone else.
+            return ctypes.get_last_error() == 5
+        try:
+            code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return True
+            return code.value == 259  # STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:  # noqa: BLE001 - unsure means alive
+        return True
 
 
 def today_key(ts: float | None = None) -> str:
@@ -175,6 +246,7 @@ class LeaseRow:
     cost_reserved_usd: float = 0.0
     cost_actual_usd: float = 0.0
     proxy_mb: float = 0.0
+    instance_id: str | None = None
     meta: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -199,21 +271,106 @@ class LeaseRow:
             cost_reserved_usd=row["cost_reserved_usd"],
             cost_actual_usd=row["cost_actual_usd"],
             proxy_mb=row["proxy_mb"],
+            instance_id=row["instance_id"],
             meta=json.loads(row["meta_json"] or "{}"),
         )
+
+
+class _Rows:
+    """A result set read to the end before anyone looks at it.
+
+    ``fetchone()`` on a live sqlite cursor leaves the statement un-finished,
+    and an un-finished SELECT pins a read snapshot. The next write on that
+    connection must then upgrade it, and if another process wrote in between,
+    SQLite fails AT ONCE with "database is locked" -- the busy timeout does not
+    apply to that case. Measured with four gateways (four Claude windows) on
+    one database: every acquire in one window failed this way.
+    """
+
+    def __init__(self, rows: list[Any]) -> None:
+        self._rows = rows
+        self._pos = 0
+
+    async def fetchone(self) -> Any:
+        if self._pos >= len(self._rows):
+            return None
+        row = self._rows[self._pos]
+        self._pos += 1
+        return row
+
+    async def fetchall(self) -> list[Any]:
+        rest = self._rows[self._pos :]
+        self._pos = len(self._rows)
+        return rest
+
+
+class _Database:
+    """The store's connection, safe to share between gateway processes.
+
+    * autocommit (``isolation_level=None``): no implicit transaction is ever
+      left open between statements;
+    * every query is drained and its cursor closed before returning;
+    * a statement that still meets a lock is retried with a short backoff --
+      in autocommit mode a failed statement changed nothing, so that is safe.
+    """
+
+    RETRIES = 8
+
+    def __init__(self, conn: aiosqlite.Connection) -> None:
+        self._conn = conn
+
+    async def execute(self, sql: str, params: Any = ()) -> _Rows:
+        for attempt in range(self.RETRIES + 1):
+            try:
+                cursor = await self._conn.execute(sql, params)
+                try:
+                    if cursor.description is None:
+                        return _Rows([])
+                    return _Rows(list(await cursor.fetchall()))
+                finally:
+                    await cursor.close()
+            except sqlite3.OperationalError as exc:
+                text = str(exc).lower()
+                if attempt == self.RETRIES or ("locked" not in text and "busy" not in text):
+                    raise
+                await asyncio.sleep(min(0.05 * (2**attempt), 1.0) * (0.5 + random.random()))
+        raise AssertionError("unreachable")
+
+    async def executescript(self, script: str) -> None:
+        await self._conn.executescript(script)
+
+    async def commit(self) -> None:
+        # Autocommit: every statement is already durable. Kept so callers can
+        # stay explicit about where a unit of work ends.
+        return None
+
+    async def close(self) -> None:
+        await self._conn.close()
 
 
 class Store:
     def __init__(self, path: Path) -> None:
         self.path = path
-        self._db: aiosqlite.Connection | None = None
+        self._db: _Database | None = None
 
     async def open(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._db = await aiosqlite.connect(self.path)
-        self._db.row_factory = aiosqlite.Row
-        await self._db.executescript(SCHEMA)
-        await self._db.commit()
+        # Several gateways (one per MCP client window) share this file: wait
+        # for a writer rather than fail, and never hold a transaction open.
+        conn = await aiosqlite.connect(self.path, timeout=15.0, isolation_level=None)
+        conn.row_factory = aiosqlite.Row
+        # Windows that start together all create the schema (and switch on
+        # WAL) at the same moment; one of them can meet a lock doing so.
+        for attempt in range(_Database.RETRIES + 1):
+            try:
+                await conn.executescript(SCHEMA)
+                break
+            except sqlite3.OperationalError as exc:
+                if attempt == _Database.RETRIES or "locked" not in str(exc).lower():
+                    await conn.close()
+                    raise
+                await asyncio.sleep(0.1 * (attempt + 1) * (0.5 + random.random()))
+        self._db = _Database(conn)
         log.info("store opened at %s", self.path)
 
     async def close(self) -> None:
@@ -222,7 +379,7 @@ class Store:
             self._db = None
 
     @property
-    def db(self) -> aiosqlite.Connection:
+    def db(self) -> _Database:
         if self._db is None:
             raise RuntimeError("store not opened")
         return self._db
@@ -406,9 +563,13 @@ class Store:
         return {r["platform_session_id"] for r in await cur.fetchall()}
 
     async def unconfirmed_stops(self) -> list[aiosqlite.Row]:
+        # Only sessions we actually asked to stop. Every live session also has
+        # stop_confirmed=0, and without the stopped_at condition reconciliation
+        # would "retry the stop" on browsers agents are using right now.
         cur = await self.db.execute(
             """SELECT * FROM platform_sessions
-               WHERE stop_confirmed=0 AND state != 'stopped' ORDER BY created_at"""
+               WHERE stop_confirmed=0 AND state != 'stopped' AND stopped_at IS NOT NULL
+               ORDER BY created_at"""
         )
         return list(await cur.fetchall())
 
@@ -541,27 +702,150 @@ class Store:
             )
         return out
 
+    # ----- instance liveness -----------------------------------------------
+
+    async def heartbeat(self, instance_id: str, *, pid: int, host: str) -> None:
+        now = time.time()
+        await self.db.execute(
+            """INSERT INTO instances (instance_id, pid, host, started_at, heartbeat_at)
+               VALUES (?,?,?,?,?)
+               ON CONFLICT(instance_id) DO UPDATE SET heartbeat_at=excluded.heartbeat_at""",
+            (instance_id, pid, host, now, now),
+        )
+        await self.db.commit()
+
+    async def remove_instance(self, instance_id: str) -> None:
+        await self.db.execute("DELETE FROM slot_claims WHERE instance_id=?", (instance_id,))
+        await self.db.execute("DELETE FROM instances WHERE instance_id=?", (instance_id,))
+        await self.db.commit()
+
+    # ----- shared slot ceiling ---------------------------------------------
+
+    _LIVE_CLAIMS = """SELECT COUNT(*) FROM slot_claims c
+                      LEFT JOIN instances i ON i.instance_id = c.instance_id
+                      WHERE c.instance_id = ? OR i.heartbeat_at >= ?"""
+
+    async def claim_slot(
+        self, instance_id: str, limit: int, max_age_seconds: float
+    ) -> str | None:
+        """Take one slot of the machine-wide ceiling, or None if it is full.
+
+        The check and the insert are one statement, so SQLite's single writer
+        makes them atomic across every gateway process. Claims of gateways
+        that stopped heartbeating no longer count.
+        """
+        claim_id = "clm_" + secrets.token_hex(8)
+        now = time.time()
+        await self.db.execute(
+            f"""INSERT INTO slot_claims (claim_id, instance_id, created_at)
+                SELECT ?, ?, ? WHERE ({self._LIVE_CLAIMS}) < ?""",
+            (claim_id, instance_id, now, instance_id, now - max_age_seconds, limit),
+        )
+        cur = await self.db.execute(
+            "SELECT 1 FROM slot_claims WHERE claim_id=?", (claim_id,)
+        )
+        return claim_id if await cur.fetchone() else None
+
+    async def add_claims(self, instance_id: str, count: int) -> list[str]:
+        """Claims without a limit check, for slots that are already occupied."""
+        ids = ["clm_" + secrets.token_hex(8) for _ in range(count)]
+        for claim_id in ids:
+            await self.db.execute(
+                "INSERT INTO slot_claims (claim_id, instance_id, created_at) VALUES (?,?,?)",
+                (claim_id, instance_id, time.time()),
+            )
+        return ids
+
+    async def release_claim(self, claim_id: str) -> None:
+        await self.db.execute("DELETE FROM slot_claims WHERE claim_id=?", (claim_id,))
+
+    async def claims_elsewhere(self, instance_id: str, max_age_seconds: float) -> int:
+        cur = await self.db.execute(
+            """SELECT COUNT(*) AS n FROM slot_claims c
+               JOIN instances i ON i.instance_id = c.instance_id
+               WHERE c.instance_id != ? AND i.heartbeat_at >= ?""",
+            (instance_id, time.time() - max_age_seconds),
+        )
+        row = await cur.fetchone()
+        return int(row["n"]) if row else 0
+
+    async def live_instance_ids(self, max_age_seconds: float, *, host: str) -> set[str]:
+        """Instances whose heartbeat is recent enough to count as running.
+
+        On the same host a recent heartbeat is double-checked against the
+        process table, so a gateway that was just killed (an MCP client
+        restart) is recognised as dead immediately rather than after the
+        heartbeat ages out.
+        """
+        cutoff = time.time() - max_age_seconds
+        await self.db.execute("DELETE FROM instances WHERE heartbeat_at < ?", (cutoff - 86400,))
+        # Claims left by gateways that died without saying goodbye.
+        await self.db.execute(
+            """DELETE FROM slot_claims WHERE instance_id NOT IN
+               (SELECT instance_id FROM instances WHERE heartbeat_at >= ?)
+               AND created_at < ?""",
+            (cutoff, cutoff),
+        )
+        await self.db.commit()
+        cur = await self.db.execute(
+            "SELECT instance_id, pid, host FROM instances WHERE heartbeat_at >= ?", (cutoff,)
+        )
+        live: set[str] = set()
+        for r in await cur.fetchall():
+            if r["host"] == host and r["pid"] and not _pid_alive(int(r["pid"])):
+                # Its process is gone: drop it now, together with its slot
+                # claims, instead of letting them block capacity until the
+                # heartbeat ages out.
+                await self.remove_instance(r["instance_id"])
+                continue
+            live.add(r["instance_id"])
+        return live
+
     # ----- startup recovery ------------------------------------------------
 
-    async def mark_stale_on_startup(self, instance_id: str) -> list[LeaseRow]:
-        """Leases left behind by a previous process cannot be driven any more.
+    async def mark_stale_on_startup(
+        self, instance_id: str, live_instances: set[str] | None = None
+    ) -> list[LeaseRow]:
+        """Leases left behind by a dead process cannot be driven any more.
 
         Their browser connection died with that process, so they are moved to
         ``unknown``: still holding a slot, still owing a reconciliation check, so
         the reaper will chase their platform session until a stop is confirmed.
+
+        Leases owned by another instance that is still heartbeating are left
+        alone -- that is a sibling gateway (another MCP client window), and its
+        agents are using those browsers right now.
         """
+        keep = set(live_instances or ()) | {instance_id}
         marks = ",".join("?" * len(SLOT_STATES))
         cur = await self.db.execute(
-            f"""SELECT * FROM leases
-                WHERE state IN ({marks}) AND (instance_id IS NULL OR instance_id != ?)""",
-            (*SLOT_STATES, instance_id),
+            f"SELECT * FROM leases WHERE state IN ({marks})", SLOT_STATES
         )
-        rows = [LeaseRow.from_row(r) for r in await cur.fetchall()]
-        if rows:
+        rows = [
+            row
+            for row in (LeaseRow.from_row(r) for r in await cur.fetchall())
+            if row.instance_id is None or row.instance_id not in keep
+        ]
+        for row in rows:
             await self.db.execute(
-                f"""UPDATE leases SET state=?, release_reason=?
-                    WHERE state IN ({marks}) AND (instance_id IS NULL OR instance_id != ?)""",
-                (ST_UNKNOWN, "gateway_restart", *SLOT_STATES, instance_id),
+                "UPDATE leases SET state=?, release_reason=? WHERE lease_id=?",
+                (ST_UNKNOWN, "gateway_restart", row.lease_id),
             )
+        if rows:
             await self.db.commit()
         return rows
+
+    async def orphaned_slot_holders(
+        self, instance_id: str, live_instances: set[str]
+    ) -> list[str]:
+        """Slot-holding leases no live process owns (after ``mark_stale_on_startup``)."""
+        keep = set(live_instances) | {instance_id}
+        marks = ",".join("?" * len(SLOT_STATES))
+        cur = await self.db.execute(
+            f"SELECT lease_id, instance_id FROM leases WHERE state IN ({marks})", SLOT_STATES
+        )
+        return [
+            r["lease_id"]
+            for r in await cur.fetchall()
+            if r["instance_id"] is None or r["instance_id"] not in keep
+        ]

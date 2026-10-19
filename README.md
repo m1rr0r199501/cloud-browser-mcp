@@ -74,6 +74,37 @@ No local Chromium is needed — the gateway connects out over CDP. For free offl
 development set `CBMCP_PROVIDER=local`, which launches local Chromium instead
 (`playwright install chromium` first).
 
+### macOS
+
+Works on Apple Silicon and Intel Macs with no extra steps beyond the above. Notes:
+
+- **Python.** The system `python3` on macOS is too old (3.9). Use `uv` as shown
+  (it downloads a suitable Python), or Homebrew's `python@3.12`.
+- **Use an absolute path** to `.venv/bin/python` when registering the server.
+  GUI apps such as Claude Desktop start servers with a minimal `PATH` and `/` as
+  the working directory; the `.env` in the project directory is still found.
+- **Several Claude windows are fine.** Each window starts its own gateway, all
+  sharing `~/.local/state/cbmcp`. Gateways heartbeat into the database, so a new
+  one never stops another live one's browsers, and a crashed one's leftovers are
+  picked up within about a minute. `CBMCP_MAX_CONCURRENCY` is **one ceiling
+  shared by all windows** (set `CBMCP_SHARE_CONCURRENCY_ACROSS_GATEWAYS=false`
+  for per-window ceilings). If the cloud account is still full -- other users,
+  or a window that just started -- `browser_acquire` queues and retries instead
+  of failing. A slot freed in one window reaches an agent waiting in another
+  within about two seconds (waiters re-check the shared count while they wait).
+- **Local provider.** `CBMCP_PROVIDER=local` uses Playwright's Chromium, or
+  Google Chrome / Chromium / Edge / Brave from `/Applications` or
+  `~/Applications`. `CBMCP_CHROMIUM_PATH` may point at the executable or at the
+  `.app` bundle. Chrome is started with `--use-mock-keychain`, so a fresh profile
+  does not pop a Keychain password prompt.
+- **Owner tag.** A Mac's hostname changes with the network it is on, which used
+  to change the default owner tag and hide this machine's own leftover sessions
+  from reconciliation. The tag is now fixed on first run in
+  `<data dir>/owner_tag`.
+- **Shutdown.** SIGTERM/SIGHUP (what MCP clients and a closing Terminal send)
+  now run the same orderly release as Ctrl-C, and the open-file limit (256 by
+  default for GUI-launched processes) is raised to 4096 at start.
+
 ---
 
 ## The cost guarantees
@@ -142,19 +173,38 @@ browser_acquire(task_label="audit", scope_allow=["example.com", "*.cdn.example.c
 
 A lease can only ever narrow `CBMCP_SCOPE_ALLOW`, never widen it.
 
+Two tools are confined for the same prompt-injection reason. `page_upload`
+only sends files from `CBMCP_UPLOAD_DIR` (default `<data dir>/uploads`), so a
+page cannot talk an agent into uploading `~/.ssh` or other local files.
+`admin_sessions(action='stop')` only stops sessions this deployment created;
+use `cbmcp stop <id>` for anything else on the account.
+
 ---
 
 ## Tools
 
-44 tools in six groups. Set `CBMCP_ENABLE_DEBUGGER_TOOLS=false` or
+49 tools in six groups. Set `CBMCP_ENABLE_DEBUGGER_TOOLS=false` or
 `CBMCP_ENABLE_ADMIN_TOOLS=false` to trim the agent's tool list and context.
 
 **Lease (5)** · `browser_acquire` `browser_queue_status` `browser_release`
 `browser_status` `browser_renew`
 
-**Page (11)** · `page_navigate` `page_tabs` `page_click` `page_type`
+**Page (16)** · `page_navigate` `page_tabs` `page_click` `page_type`
 `page_select` `page_press` `page_scroll` `page_wait` `page_upload`
-`page_emulate` `page_cookies`
+`page_emulate` `page_cookies` `page_hover` `page_drag` `page_mouse`
+`page_dialog` `page_downloads`
+
+The page tools cover what a person does in a browser, not just what a test
+script does: hover menus (`page_hover`), drag and drop and sliders
+(`page_drag`), raw mouse at screenshot coordinates for canvas, maps and image
+challenges (`page_mouse`; screenshots are in CSS pixels so the two line up),
+typing into whatever has focus (`page_type` without a target), answering
+`confirm()`/`prompt()` with OK and text (`page_dialog`; Cancel by default),
+files the page downloads (`page_downloads`, saved on the gateway host), "Allow"
+on permission prompts (`page_emulate(grant_permissions=[...])`), and switching
+tabs, which brings the tab to the front. Every action result also reports what
+a person would notice: tabs the page opened, dialogs it showed, files it
+downloaded.
 
 **Inspect (7)** · `page_snapshot` `page_text` `page_html` `page_screenshot`
 `page_eval` `page_console` `page_inventory`
@@ -368,11 +418,29 @@ From the runs above, so expectations are calibrated:
 ## Tests
 
 ```bash
-python -m pytest tests/ -q                  # 47 tests, no cloud account needed
+python -m pytest tests/ -q                  # offline, no cloud account needed
+python scripts/usage_simulation.py          # realistic multi-window run, ~4 min, ~$0.02
 python scripts/concurrency_test.py --agents 6 --max-concurrency 2
 python scripts/verify_new_tools.py          # initiator, text breakpoint, emulate, bundle
 python scripts/fingerprint_check.py         # how detectable the instrumentation is
 ```
+
+### The usage simulation
+
+`usage_simulation.py` is the closest thing to real use short of real agents.
+Five Claude windows (five gateway processes) open at different times and send
+out 22 subagents that work like LLM agents -- read `page_snapshot`, pick an
+element by role and name, act on its ref, think between calls -- on real sites
+(books.toscrape.com, Hacker News, MDN, GitHub, example.com,
+the-internet.herokuapp.com). Personas reproduce real failure modes: forgetting
+to release, pausing past the idle timeout, renewing before a pause, retrying
+`browser_acquire`, parallel tool calls, long multi-site sessions. One window is
+closed mid-task, one crashes, one is opened afterwards, and peak demand exceeds
+the ceiling of 6. It runs on its own throwaway data dir.
+
+Last run against Browser Use: 117/117 checks, peak 6 browsers for a ceiling of
+6, the crashed window's browsers stopped 18s after the crash (as soon as the
+next window opened), nothing left running.
 
 ### The acceptance test
 
@@ -428,10 +496,15 @@ unit tests, and are worth knowing about if you extend the hook runtime:
 
 ## Limitations
 
-- **Single process.** Slot accounting is in-process (asyncio lock). Running two
-  gateways against one cloud account is safe — reconciliation is conservative and
-  never stops another process's sessions — but the combined ceiling is then the
-  sum of both. Horizontal scaling would need the counter in Redis.
+- **One machine.** Gateways on one machine share the ceiling through atomic
+  slot claims in the SQLite database (measured on Browser Use: ten requests
+  from three windows at the same instant against a ceiling of six -- six ran,
+  four queued). Gateways on different machines, or with different data dirs,
+  do not see each other's claims; horizontal scaling would need the counter in
+  Redis.
+- **Some sites refuse cloud browsers.** Measured: Wikipedia answers Browser Use
+  browsers with HTTP 429, through the platform's residential proxy too.
+  `page_navigate` flags such responses with `http_error` and a `warning`.
 - **No browser reuse between leases.** Considered and rejected: handing a used
   browser to another agent would carry cookies, storage and login state across,
   which breaks the isolation guarantee for a few cents of saved cold start.

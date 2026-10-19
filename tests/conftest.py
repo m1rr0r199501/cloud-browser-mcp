@@ -17,6 +17,7 @@ import pytest
 
 from cbmcp.budget import BudgetGuard
 from cbmcp.config import Settings
+from cbmcp.errors import ProviderConcurrencyLimit
 from cbmcp.pool import BrowserPool
 from cbmcp.providers.base import AccountInfo, ProviderSession, SessionSpec
 from cbmcp.store import Store
@@ -34,6 +35,7 @@ class FakeProvider:
         create_delay: float = 0.0,
         fail_create: bool = False,
         stop_confirms: bool = True,
+        stop_accepts: bool = True,
     ) -> None:
         self.sessions: dict[str, ProviderSession] = {}
         self.seq = 0
@@ -41,6 +43,13 @@ class FakeProvider:
         self.create_delay = create_delay
         self.fail_create = fail_create
         self.stop_confirms = stop_confirms
+        self.stop_accepts = stop_accepts
+        # Reject this many creates with "account at its concurrency limit".
+        self.concurrency_rejections = 0
+        # After an accepted stop, keep reporting "active" for this many polls
+        # (Browser Use's status lags the stop by a moment).
+        self.stop_lag_polls = 0
+        self._lag: dict[str, int] = {}
         self.created: list[SessionSpec] = []
         self.stopped: list[str] = []
 
@@ -49,6 +58,9 @@ class FakeProvider:
             await asyncio.sleep(self.create_delay)
         if self.fail_create:
             raise RuntimeError("provider refused to create a session")
+        if self.concurrency_rejections > 0:
+            self.concurrency_rejections -= 1
+            raise ProviderConcurrencyLimit("account at its concurrent-session limit")
         self.seq += 1
         sid = f"fake{self.seq}"
         now = time.time()
@@ -65,7 +77,13 @@ class FakeProvider:
         return session
 
     async def get_session(self, session_id: str) -> ProviderSession | None:
-        return self.sessions.get(session_id)
+        session = self.sessions.get(session_id)
+        if session is not None and self._lag.get(session_id):
+            self._lag[session_id] -= 1
+            if self._lag[session_id] == 0:
+                session.status = "stopped"
+                session.finished_at = time.time()
+        return session
 
     async def list_sessions(
         self, *, active_only: bool = True, limit: int = 500
@@ -76,11 +94,15 @@ class FakeProvider:
         return items[:limit]
 
     async def stop_session(self, session_id: str) -> bool:
+        if not self.stop_accepts:
+            return False  # e.g. the API was unreachable
         self.stopped.append(session_id)
         session = self.sessions.get(session_id)
         if session is None:
             return True
-        if self.stop_confirms:
+        if self.stop_confirms and self.stop_lag_polls:
+            self._lag[session_id] = self.stop_lag_polls
+        elif self.stop_confirms:
             session.status = "stopped"
             session.finished_at = time.time()
             session.cdp_url = None
