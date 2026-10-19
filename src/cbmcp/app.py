@@ -98,6 +98,12 @@ class App:
         if not self.started:
             return
         log.info("shutting down; releasing all leases")
+        if self.pool is not None:
+            # First, before anything slow: the MCP client kills this process
+            # about two seconds after closing the window. See stop_all_now.
+            with contextlib.suppress(Exception):
+                stopped = await asyncio.wait_for(self.pool.stop_all_now(), timeout=10)
+                log.info("sent stop for %d cloud session(s)", stopped)
         if self.reaper is not None:
             await self.reaper.stop()
         if self.pool is not None:
@@ -106,6 +112,10 @@ class App:
                     self.pool.release_all(reason="gateway_shutdown"), timeout=90
                 )
                 log.info("released %d lease(s) on shutdown", released)
+        # A clean exit says so at once, rather than leaving sibling gateways to
+        # wait for this heartbeat to age out before they adopt anything left over.
+        with contextlib.suppress(Exception):
+            await self.store.remove_instance(self.s.instance_id)
         if self._pw_ctx is not None:
             with contextlib.suppress(Exception):
                 await self._pw_ctx.__aexit__(None, None, None)

@@ -316,9 +316,12 @@ PAGE_TEXT_JS = r"""
 # targets, storage contents, and the shape of injected globals.
 PAGE_INVENTORY_JS = r"""
 () => {
-  const take = (store) => {
+  // Takes a getter: merely *reading* window.localStorage throws a
+  // SecurityError on opaque origins (data: URLs, sandboxed frames).
+  const take = (getStore) => {
     const out = {};
     try {
+      const store = getStore();
       for (let i = 0; i < Math.min(store.length, 60); i++) {
         const k = store.key(i);
         out[k] = String(store.getItem(k) || '').slice(0, 300);
@@ -344,8 +347,8 @@ PAGE_INVENTORY_JS = r"""
     title: document.title,
     scripts: scripts,
     forms: forms,
-    local_storage: take(window.localStorage),
-    session_storage: take(window.sessionStorage),
+    local_storage: take(() => window.localStorage),
+    session_storage: take(() => window.sessionStorage),
     iframes: Array.from(document.querySelectorAll('iframe,frame')).slice(0, 30)
       .map(f => ({ src: f.getAttribute('src'), sandbox: f.getAttribute('sandbox') })),
     meta_csp: (document.querySelector('meta[http-equiv="Content-Security-Policy"]') || {}).content || null,

@@ -22,15 +22,18 @@ platform has already stopped get cleaned up locally so their slot comes back.
 Orphan identification is deliberately conservative. The owner tag in session
 metadata identifies this *deployment* (stable across restarts), and the shared
 SQLite database is the authority on which lease a session belongs to. A session
-is only stopped when the database agrees it is dead. Sessions belonging to
-another live process, or to another user of the same cloud account, are never
-touched.
+is only stopped when the database agrees it is dead, or when the process that
+owns it has stopped heartbeating. Sessions belonging to another live process --
+every MCP client window starts its own gateway, all sharing one database -- or
+to another user of the same cloud account, are never touched.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
+import socket
 import time
 from typing import Any
 
@@ -44,7 +47,9 @@ from .store import (
     ST_ACTIVE,
     ST_CREATING,
     ST_RELEASED,
+    ST_RELEASING,
     ST_UNKNOWN,
+    LeaseRow,
     Store,
 )
 
@@ -73,6 +78,9 @@ class Reaper:
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
         self._last_reconcile = 0.0
+        self._host = socket.gethostname()
+        # A sibling gateway whose heartbeat is older than this is presumed dead.
+        self._heartbeat_max_age = settings.heartbeat_max_age_seconds
         # platform_session_id -> how many times we have re-sent an unhonoured stop
         self._stop_attempts: dict[str, int] = {}
         self.stats: dict[str, Any] = {
@@ -108,6 +116,7 @@ class Reaper:
     async def _loop(self) -> None:
         while not self._stop.is_set():
             try:
+                await self.heartbeat()
                 await self.sweep()
                 if time.time() - self._last_reconcile >= self.s.reconcile_interval_seconds:
                     await self.reconcile()
@@ -119,6 +128,17 @@ class Reaper:
             with contextlib.suppress(TimeoutError):
                 async with asyncio.timeout(self.s.reaper_interval_seconds):
                     await self._stop.wait()
+
+    # ----- instance liveness ----------------------------------------------
+
+    async def heartbeat(self) -> None:
+        await self.store.heartbeat(self.s.instance_id, pid=os.getpid(), host=self._host)
+
+    async def _live_instances(self) -> set[str]:
+        """Instance ids of gateways (including this one) that are still running."""
+        live = await self.store.live_instance_ids(self._heartbeat_max_age, host=self._host)
+        live.add(self.s.instance_id)
+        return live
 
     # ----- layer 1 & 2: local sweep ---------------------------------------
 
@@ -135,6 +155,13 @@ class Reaper:
             self.stats["queue_timeouts"] += housekeeping["expired_tickets"]
         if housekeeping["reclaimed_unclaimed"]:
             self.stats["reclaimed_unclaimed"] += len(housekeeping["reclaimed_unclaimed"])
+
+        # A slot held only by an unconfirmed stop is capacity no agent can use.
+        # Chase those every sweep rather than waiting for the next full
+        # reconciliation (two minutes by default).
+        if self.pool.has_unsettled_stops:
+            with contextlib.suppress(Exception):
+                await self._settle_unconfirmed_stops()
 
         for lease in list(self.pool.live_leases()):
             if lease.state != ST_ACTIVE:
@@ -191,9 +218,20 @@ class Reaper:
 
     async def reconcile(self) -> dict[str, Any]:
         """Compare platform truth with local state, in both directions."""
-        self._last_reconcile = time.time()
+        started = time.time()
+        self._last_reconcile = started
         self.stats["reconciles"] += 1
         await self.pool.refresh_platform_limit()
+
+        # Snapshot local state BEFORE asking the platform. A lease that becomes
+        # active while the list call is in flight must not be judged against a
+        # list that predates it -- that would release a browser an agent just
+        # received.
+        ours_live = {
+            lease.platform_session_id: lease
+            for lease in self.pool.live_leases()
+            if lease.platform_session_id
+        }
 
         try:
             remote = await self.provider.list_sessions(active_only=True, limit=500)
@@ -203,11 +241,7 @@ class Reaper:
             return {"ok": False, "error": str(exc)[:200]}
 
         remote_by_id = {session.id: session for session in remote}
-        ours_live = {
-            lease.platform_session_id: lease
-            for lease in self.pool.live_leases()
-            if lease.platform_session_id
-        }
+        live_instances = await self._live_instances()
 
         report: dict[str, Any] = {
             "platform_active": len(remote),
@@ -221,7 +255,7 @@ class Reaper:
 
         # Direction 1: the platform is billing something we do not hold.
         for session in remote:
-            if session.id in ours_live:
+            if session.id in ours_live or self._held_in_memory(session):
                 await self.store.upsert_platform_session(
                     platform_session_id=session.id,
                     provider=self.provider.name,
@@ -230,19 +264,30 @@ class Reaper:
                     proxy_mb=session.proxy_mb,
                 )
                 continue
-            verdict = await self._classify(session)
+            verdict, row = await self._classify(session, live_instances)
             if verdict == "orphan":
                 stopped = await self.provider.stop_session(session.id)
                 await self.store.upsert_platform_session(
                     platform_session_id=session.id,
                     provider=self.provider.name,
                     state="stopped" if stopped else "unknown",
+                    lease_id=row.lease_id if row else None,
                     cost_usd=session.total_cost_usd,
                     proxy_mb=session.proxy_mb,
                     stopped=True,
                     stop_confirmed=stopped,
                     note="orphan stopped by reconciliation",
                 )
+                if row is not None and row.state in SLOT_STATES:
+                    # Close out the lease the dead process left behind, and
+                    # return its slot if this process was carrying it.
+                    await self.store.update_lease(
+                        row.lease_id,
+                        state=ST_RELEASED if stopped else ST_UNKNOWN,
+                        release_reason="orphan_reconciled",
+                    )
+                    if stopped:
+                        await self.pool.settle_unknown(row.lease_id)
                 await self.store.bump("orphans_stopped")
                 await self.store.audit(
                     "reconcile.orphan_stopped",
@@ -282,17 +327,28 @@ class Reaper:
                 self.stats["unknown_settled"] += 1
                 report["settled_unknown"].append(lease.lease_id)
                 continue
-            if lease.state in (ST_ACTIVE, ST_CREATING):
-                # The cloud session is gone but the lease still looks alive: the
-                # platform timed it out or stopped it underneath us.
-                log.warning(
-                    "lease %s lost its cloud session %s; releasing locally",
-                    lease.lease_id,
-                    session_id,
-                )
-                with contextlib.suppress(Exception):
-                    await self.pool.release(lease, reason="platform_session_gone")
-                report["vanished"].append(lease.lease_id)
+            # Only a lease that was already active before the list was taken
+            # can be judged by it; creating/releasing ones are mid-transition.
+            if lease.state != ST_ACTIVE or not lease.activated_at:
+                continue
+            if lease.activated_at > started:
+                continue
+            # A list can lag. Ask about this one session directly before
+            # tearing a browser away from an agent.
+            with contextlib.suppress(Exception):
+                current = await self.provider.get_session(session_id)
+                if current is not None and current.status == "active":
+                    continue
+            # The cloud session is gone but the lease still looks alive: the
+            # platform timed it out or stopped it underneath us.
+            log.warning(
+                "lease %s lost its cloud session %s; releasing locally",
+                lease.lease_id,
+                session_id,
+            )
+            with contextlib.suppress(Exception):
+                await self.pool.release(lease, reason="platform_session_gone")
+            report["vanished"].append(lease.lease_id)
 
         await self._settle_unconfirmed_stops()
         await self._check_stale_intents()
@@ -301,7 +357,27 @@ class Reaper:
         report["ok"] = True
         return report
 
-    async def _classify(self, session: ProviderSession) -> str:
+    def _held_in_memory(self, session: ProviderSession) -> bool:
+        """Is this session's lease one this process is creating or holding?
+
+        During creation the platform can list a session before the create call
+        has returned and the lease has recorded its id. Without this check that
+        session looks like an orphan of our own instance and gets stopped while
+        the agent waits for it.
+        """
+        if session.metadata.get("cbmcp_owner") != self.s.owner_tag:
+            return False
+        lease = self.pool.lease_by_id(session.metadata.get("cbmcp_lease") or "")
+        return lease is not None and lease.state in (
+            ST_CREATING,
+            ST_ACTIVE,
+            ST_RELEASING,
+            ST_UNKNOWN,
+        )
+
+    async def _classify(
+        self, session: ProviderSession, live_instances: set[str]
+    ) -> tuple[str, LeaseRow | None]:
         """Decide whether a platform session is ours to stop.
 
         Conservative on purpose: stopping someone else's browser mid-task is
@@ -310,26 +386,28 @@ class Reaper:
         owner = session.metadata.get("cbmcp_owner")
         if owner != self.s.owner_tag:
             if not owner and self.s.reconcile_stop_untagged:
-                return "orphan"
-            return "untagged"
+                return "orphan", None
+            return "untagged", None
 
         lease_id = session.metadata.get("cbmcp_lease")
         if not lease_id:
-            return "orphan"  # our tag, but no lease to belong to
+            return "orphan", None  # our tag, but no lease to belong to
 
         row = await self.store.get_lease(lease_id)
         if row is None:
-            return "orphan"  # our tag, lease unknown even to the database
+            return "orphan", None  # our tag, lease unknown even to the database
         if row.state not in SLOT_STATES:
-            return "orphan"  # the database says this lease is finished
-        instance = session.metadata.get("cbmcp_instance")
+            return "orphan", row  # the database says this lease is finished
+        instance = row.instance_id or session.metadata.get("cbmcp_instance")
         if instance == self.s.instance_id:
             # Our own instance, live in the DB, but not in memory -- it cannot be
             # driven any more, so it is ours to stop.
-            return "orphan"
-        # Another process on this deployment still claims it. Leave it alone and
-        # let that process (or its own restart recovery) deal with it.
-        return "other_instance"
+            return "orphan", row
+        if instance in live_instances:
+            # Another running gateway on this deployment holds it. Leave it alone.
+            return "other_instance", row
+        # Its process has stopped heartbeating, so nothing can drive it.
+        return "orphan", row
 
     async def _settle_unconfirmed_stops(self) -> None:
         """Keep chasing stops the platform never confirmed, and settle cost drift."""
@@ -429,12 +507,19 @@ class Reaper:
     # ----- startup ---------------------------------------------------------
 
     async def startup_recovery(self) -> dict[str, Any]:
-        """Deal with whatever the previous process left behind, before serving."""
-        stale = await self.store.mark_stale_on_startup(self.s.instance_id)
+        """Deal with whatever a dead previous process left behind, before serving.
+
+        "Previous process" is decided by heartbeat, not by instance id alone:
+        a second MCP client window starts a second gateway on the same database,
+        and its leases belong to agents that are working right now.
+        """
+        await self.heartbeat()
+        live = await self._live_instances()
+        stale = await self.store.mark_stale_on_startup(self.s.instance_id, live)
         if stale:
             log.warning(
-                "%d lease(s) from a previous run were still marked live; they are now "
-                "'unknown' and will be reconciled",
+                "%d lease(s) from a gateway that is no longer running were still marked "
+                "live; they are now 'unknown' and will be reconciled",
                 len(stale),
             )
             for row in stale:
@@ -444,26 +529,37 @@ class Reaper:
                     outcome="unknown",
                     platform_session_id=row.platform_session_id,
                 )
+                if not row.platform_session_id:
+                    # It died mid-creation. Any session that creation produced
+                    # carries our owner tag and lease id, so the reconcile below
+                    # finds it as an orphan once this row is closed.
+                    await self.store.update_lease(
+                        row.lease_id, state=ST_RELEASED, release_reason="startup_recovery"
+                    )
+                    continue
                 # Stop them directly: the connection died with the old process,
                 # so nothing can be driving them.
-                if row.platform_session_id:
-                    with contextlib.suppress(Exception):
-                        stopped = await self.provider.stop_session(row.platform_session_id)
-                        await self.store.upsert_platform_session(
-                            platform_session_id=row.platform_session_id,
-                            provider=self.provider.name,
-                            state="stopped" if stopped else "unknown",
-                            lease_id=row.lease_id,
-                            stopped=True,
-                            stop_confirmed=stopped,
-                            note="stopped during startup recovery",
-                        )
-                        if stopped:
-                            await self.store.update_lease(
-                                row.lease_id, state=ST_RELEASED, release_reason="startup_recovery"
-                            )
+                stopped = False
+                with contextlib.suppress(Exception):
+                    stopped = await self.provider.stop_session(row.platform_session_id)
+                # Recorded as "stop requested" whether or not the call got
+                # through, so reconciliation keeps chasing it either way.
+                with contextlib.suppress(Exception):
+                    await self.store.upsert_platform_session(
+                        platform_session_id=row.platform_session_id,
+                        provider=self.provider.name,
+                        state="stopped" if stopped else "unknown",
+                        lease_id=row.lease_id,
+                        stopped=True,
+                        stop_confirmed=stopped,
+                        note="stopped during startup recovery",
+                    )
+                if stopped:
+                    await self.store.update_lease(
+                        row.lease_id, state=ST_RELEASED, release_reason="startup_recovery"
+                    )
 
-        await self.pool.restore_slots()
+        await self.pool.restore_slots(live)
         result: dict[str, Any] = {"stale_leases": len(stale)}
         if self.s.reconcile_on_startup:
             result["reconcile"] = await self.reconcile()

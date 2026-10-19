@@ -737,10 +737,20 @@ class JsDebugger:
         }.get(action)
         if command is None:
             raise InvalidArgument("action must be resume, over, into or out")
+        # Forget the current pause BEFORE sending. If it were cleared only by the
+        # Debugger.resumed event, wait_for_pause below could see the old pause
+        # still set and report the pre-step location as where the step landed.
+        previous = self.paused
+        self.paused = None
         self._pause_event.clear()
-        await self.cdp.send(command)
+        try:
+            await self.cdp.send(command)
+        except Exception:
+            self.paused = previous
+            if previous is not None:
+                self._pause_event.set()
+            raise
         if action == "resume":
-            self.paused = None
             return {"ok": True, "action": action, "paused": False}
         # A step lands on the next statement; give it a moment to report back.
         landed = await self.wait_for_pause(5.0)

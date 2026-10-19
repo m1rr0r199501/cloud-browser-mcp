@@ -7,12 +7,18 @@ next start must find and stop them.
 
 from __future__ import annotations
 
+import asyncio
+import os
+import socket
 import time
+
+import pytest
 
 from cbmcp.budget import BudgetGuard
 from cbmcp.pool import AcquireRequest, BrowserPool
+from cbmcp.providers.base import ProviderSession
 from cbmcp.reaper import Reaper
-from cbmcp.store import ST_RELEASED, ST_UNKNOWN, new_lease_token
+from cbmcp.store import ST_ACTIVE, ST_RELEASED, ST_UNKNOWN, new_lease_token
 
 
 def _reaper(settings, store, pool) -> Reaper:
@@ -36,6 +42,29 @@ async def test_idle_lease_is_reclaimed(settings, store, pool):
     assert outcome["idle"] == 1
     assert pool.stats()["slots_used"] == 0
     assert pool.provider.sessions["fake1"].status == "stopped"
+
+
+async def test_a_reclaimed_token_says_why_and_how_to_avoid_it(settings, store, pool):
+    """Simulation finding: an agent back from a long pause got only 'unknown
+    token' and could not learn that browser_renew would have kept its browser."""
+    from cbmcp.errors import LeaseExpired, LeaseNotActive
+
+    lease = await pool.acquire(AcquireRequest(task_label="wandered-off"))
+    obj = pool.resolve_token(lease["lease"])
+    obj.idle_timeout_seconds = 0.1
+    obj.last_activity_at = time.time() - 5
+    await _reaper(settings, store, pool).sweep()
+
+    with pytest.raises(LeaseExpired) as exc:
+        pool.resolve_token(lease["lease"])
+    assert "no tool call" in exc.value.message and "browser_renew" in exc.value.hint
+
+    other = await pool.acquire(AcquireRequest(task_label="done"))
+    await pool.release_by_token(other["lease"])
+    with pytest.raises(LeaseNotActive):
+        pool.resolve_token(other["lease"])
+    again = await pool.release_by_token(other["lease"])
+    assert again["status"] == "already_released"
 
 
 async def test_max_lifetime_is_enforced_even_while_busy(settings, store, pool):
@@ -215,6 +244,178 @@ async def test_create_intent_is_written_before_the_provider_call(settings, store
     assert len(rows) == 1
     assert rows[0]["resolved"] == 1
     assert "refused" in (rows[0]["note"] or "")
+
+
+def _spec(metadata: dict) -> object:
+    return type(
+        "Spec",
+        (),
+        {
+            "timeout_minutes": 5,
+            "network": type("N", (), {"kind": "direct", "custom": None})(),
+            "screen_width": None,
+            "screen_height": None,
+            "solve_captchas": False,
+            "pdf_renderer_enabled": True,
+            "enable_recording": False,
+            "profile_id": None,
+            "metadata": metadata,
+        },
+    )()
+
+
+async def test_reconcile_never_stops_a_session_that_is_in_use(settings, store, pool):
+    """Regression: every live session also has stop_confirmed=0, and the
+    unconfirmed-stop sweep used to "retry the stop" on all of them -- killing
+    every agent's browser on the first reconcile after acquire."""
+    lease = await pool.acquire(AcquireRequest(task_label="busy"))
+    obj = pool.resolve_token(lease["lease"])
+
+    report = await _reaper(settings, store, pool).reconcile()
+
+    assert pool.provider.stopped == [], "a browser in use must never be stopped"
+    assert pool.provider.sessions["fake1"].status == "active"
+    assert obj.state == ST_ACTIVE
+    assert report["orphans_stopped"] == []
+    assert report["vanished"] == []
+
+
+async def test_reconcile_skips_a_session_still_being_created(settings, store, pool):
+    """The platform can list a session before create_session has returned."""
+    pool.provider.create_delay = 0.3
+    settings.acquire_block_seconds = 0.0
+    ticket = await pool.acquire(AcquireRequest(task_label="cold-start"))
+    assert ticket["status"] == "creating"
+    await asyncio.sleep(0.05)  # the create call is now in flight
+    # Simulate the platform already listing it, tagged with our lease.
+    creating = next(iter(pool._leases.values()))
+    pool.provider.sessions["early"] = ProviderSession(
+        id="early",
+        cdp_url="ws://x",
+        status="active",
+        metadata={
+            "cbmcp_owner": settings.owner_tag,
+            "cbmcp_instance": settings.instance_id,
+            "cbmcp_lease": creating.lease_id,
+        },
+    )
+
+    task = creating.creation_task
+    report = await _reaper(settings, store, pool).reconcile()
+    assert "early" not in report["orphans_stopped"]
+    assert "early" not in pool.provider.stopped
+    if task is not None:
+        await asyncio.wait({task}, timeout=5)
+
+
+async def test_startup_leaves_a_running_sibling_gateways_leases_alone(settings, store):
+    """Two MCP client windows = two gateways on one database. Starting the
+    second must not stop the first one's browsers."""
+    from .conftest import FakeProvider
+
+    provider = FakeProvider()
+    session = await provider.create_session(_spec({}))
+    await store.heartbeat("sibling", pid=os.getpid(), host=socket.gethostname())
+    await store.insert_lease(
+        lease_id="lse_sibling",
+        token=new_lease_token(),
+        provider="fake",
+        state="active",
+        owner=None,
+        task_label="someone else's agent",
+        idempotency_key=None,
+        scope=[],
+        network_mode="direct",
+        expires_at=None,
+        instance_id="sibling",
+    )
+    await store.update_lease("lse_sibling", platform_session_id=session.id)
+
+    budget = BudgetGuard(settings, store)
+    pool = BrowserPool(
+        settings=settings, store=store, provider=provider, budget=budget, playwright=None
+    )
+    reaper = Reaper(settings=settings, store=store, provider=provider, pool=pool, budget=budget)
+
+    report = await reaper.startup_recovery()
+    assert report["stale_leases"] == 0
+    assert provider.sessions[session.id].status == "active"
+    assert pool.stats()["slots_used"] == 0, "a sibling's lease is not our slot"
+    row = await store.get_lease("lse_sibling")
+    assert row is not None and row.state == ST_ACTIVE
+
+
+async def test_slot_restored_from_a_dead_run_is_returned_once_stopped(settings, store):
+    from .conftest import FakeProvider
+
+    provider = FakeProvider(stop_accepts=False)  # the API is down at startup
+    lease_id = "lse_left_behind"
+    session = await provider.create_session(
+        _spec(
+            {
+                "cbmcp_owner": settings.owner_tag,
+                "cbmcp_instance": "dead-process",
+                "cbmcp_lease": lease_id,
+            }
+        )
+    )
+    await store.insert_lease(
+        lease_id=lease_id,
+        token=new_lease_token(),
+        provider="fake",
+        state="active",
+        owner=None,
+        task_label=None,
+        idempotency_key=None,
+        scope=[],
+        network_mode="direct",
+        expires_at=None,
+        instance_id="dead-process",
+    )
+    await store.update_lease(lease_id, platform_session_id=session.id)
+
+    budget = BudgetGuard(settings, store)
+    pool = BrowserPool(
+        settings=settings, store=store, provider=provider, budget=budget, playwright=None
+    )
+    reaper = Reaper(settings=settings, store=store, provider=provider, pool=pool, budget=budget)
+    await reaper.startup_recovery()
+    assert pool.stats()["slots_used"] == 1, "an unconfirmed stop keeps its slot"
+
+    provider.stop_accepts = True  # the API is back
+    await reaper.reconcile()
+    assert provider.sessions[session.id].status == "stopped"
+    assert pool.stats()["slots_used"] == 0, "the restored slot must come back"
+
+
+async def test_a_crashed_gateways_slot_claims_are_freed_at_once(settings, store):
+    """Same machine, process gone: its claims must not block capacity for the
+    minute it takes the heartbeat to age out."""
+    import subprocess
+    import sys
+
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    await store.heartbeat("crashed", pid=proc.pid, host=socket.gethostname())
+    await store.add_claims("crashed", 2)
+    assert await store.claims_elsewhere(settings.instance_id, 60) == 2
+
+    live = await store.live_instance_ids(60, host=socket.gethostname())
+    assert "crashed" not in live
+    assert await store.claims_elsewhere(settings.instance_id, 60) == 0
+
+
+def test_pid_check_tells_a_dead_gateway_from_a_live_one():
+    """How a new window knows at once that a crashed window's gateway is gone."""
+    import subprocess
+    import sys
+
+    from cbmcp.store import _pid_alive
+
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    assert _pid_alive(os.getpid()) is True
+    assert _pid_alive(proc.pid) is False
 
 
 async def test_audit_trail_records_lifecycle_without_secrets(settings, store, pool):

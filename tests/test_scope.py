@@ -36,6 +36,12 @@ def test_enforce_blocks_out_of_scope():
     rule.enforce("https://example.com/ok")
 
 
+def test_lease_cannot_switch_off_operator_warnings():
+    lease = global_scope("warn", [], []).narrow(None, None, "off")
+    assert lease.mode == "warn"
+    assert global_scope("off", [], []).narrow(None, None, "enforce").mode == "enforce"
+
+
 def test_warn_mode_does_not_raise():
     rule = ScopeRule(mode="warn", allow=("example.com",))
     assert not rule.permits("https://evil.net")[0]

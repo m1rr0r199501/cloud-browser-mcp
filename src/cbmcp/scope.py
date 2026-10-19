@@ -19,6 +19,8 @@ from .errors import ScopeViolation
 # Schemes that never leave the browser, so they are always allowed.
 _LOCAL_SCHEMES = {"about", "data", "blob", "chrome", "devtools", "javascript", "file"}
 
+_MODE_RANK = {"off": 0, "warn": 1, "enforce": 2}
+
 
 def normalise_host(host: str) -> str:
     host = (host or "").strip().lower().rstrip(".")
@@ -120,9 +122,15 @@ class ScopeRule:
         else:
             effective_allow = new_allow or self.allow
 
-        effective_mode = mode or self.mode
-        if self.mode == "enforce":
-            effective_mode = "enforce"  # operators can tighten, leases cannot loosen
+        if mode is not None and mode not in _MODE_RANK:
+            raise ScopeViolation(
+                f"unknown scope mode {mode!r}", hint="Use 'off', 'warn' or 'enforce'."
+            )
+        # Operators can tighten, leases cannot loosen: not enforce -> warn, and
+        # not warn -> off either (which would silence the operator's warnings).
+        effective_mode = max(
+            (mode or self.mode, self.mode), key=lambda m: _MODE_RANK.get(m, 0)
+        )
         if effective_mode == "off" and effective_allow:
             effective_mode = "enforce"
 

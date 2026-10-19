@@ -456,6 +456,12 @@ class NetworkRecorder:
         except OSError as exc:
             entry.body_error = f"write failed: {exc.strerror}"
             return
+        if self._entries.get(entry.id) is not entry:
+            # Evicted from the ring buffer (or net_clear ran) while the body was
+            # in flight; nothing references this file any more.
+            with contextlib.suppress(OSError):
+                path.unlink()
+            return
         entry.body_path = path
         entry.body_bytes = len(data)
         entry.body_is_base64 = not textual

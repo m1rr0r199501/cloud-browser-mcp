@@ -65,6 +65,13 @@ page to capture startup behaviour.
 """
 
 
+_STALE_INIT_NOTE = (
+    "This Playwright version cannot remove an init script, so the removed hooks "
+    "will still be installed on future page loads in this lease. Upgrade "
+    "playwright, or release and acquire a fresh browser for a clean slate."
+)
+
+
 def register(mcp: MCPServer) -> None:
     # ----- scripts ---------------------------------------------------------
 
@@ -514,6 +521,7 @@ def register(mcp: MCPServer) -> None:
                 }
             if action == "clear":
                 removed = session.hooks.clear_specs()
+                synced = await session.sync_hook_init_script()
                 return {
                     "ok": True,
                     "removed_specs": removed,
@@ -521,16 +529,23 @@ def register(mcp: MCPServer) -> None:
                         "No new hooks will be installed on future page loads. Functions "
                         "already wrapped in the current document stay wrapped until a "
                         "reload -- call page_navigate(action='reload') for a clean page."
+                        if synced
+                        else _STALE_INIT_NOTE
                     ),
                 }
             if action == "remove":
                 if not handle:
                     raise InvalidArgument("action='remove' needs handle")
                 removed = session.hooks.remove(handle)
+                synced = await session.sync_hook_init_script() if removed else True
                 return {
                     "ok": True,
                     "removed": removed,
-                    "note": "Reload the page to drop wrappers from the current document.",
+                    "note": (
+                        "Reload the page to drop wrappers from the current document."
+                        if synced
+                        else _STALE_INIT_NOTE
+                    ),
                 }
             if action != "add":
                 raise InvalidArgument("action must be add, remove, list or clear")

@@ -88,6 +88,21 @@ class ProviderQuotaError(ProviderError):
     )
 
 
+class ProviderConcurrencyLimit(ProviderQuotaError):
+    """The account is at its concurrent-session limit right now.
+
+    Unlike running out of credits this clears by itself as other sessions end
+    -- typically another Claude window's gateway on the same account -- so the
+    pool requeues the request instead of failing it.
+    """
+
+    code = "provider_concurrency"
+    hint = (
+        "The cloud account is at its concurrent-session limit. The request was "
+        "queued; poll browser_queue_status with your ticket_id."
+    )
+
+
 class BrowserConnectionError(CbmcpError):
     code = "browser_connection_error"
     hint = "The browser connection broke. Release this lease and acquire a new one."

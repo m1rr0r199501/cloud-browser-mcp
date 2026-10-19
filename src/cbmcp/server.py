@@ -8,6 +8,9 @@ cheerfully accepts new work.
 
 from __future__ import annotations
 
+import contextlib
+import os
+import signal
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -21,7 +24,15 @@ from .tools import register_all
 
 log = get_logger("server")
 
+# Set once the lifespan starts tearing down; read by the SIGTERM handler.
+_shutting_down = False
+
 INSTRUCTIONS = """Cloud browser gateway for parallel agents.
+
+Whenever a task needs a real web browser -- opening or operating a website,
+logging in, filling in forms, clicking through a flow, taking screenshots,
+downloading files, or inspecting a page's network traffic or JavaScript -- use
+this server, starting with `browser_acquire`.
 
 Rent a browser with `browser_acquire`, drive it with the `page_*` tools, observe
 traffic with `net_*`, and debug JavaScript with `js_*`. Release it with
@@ -44,6 +55,13 @@ Rules that matter:
 * Work only on hosts you are authorised to test. A lease can be pinned to a host
   allowlist with `scope_allow`, enforced on every request.
 
+Drive the page the way a person would: `page_snapshot` for refs, then
+`page_click` / `page_type` / `page_hover` / `page_drag`; `page_mouse` clicks
+screenshot coordinates (canvas, maps, image challenges). `confirm()` dialogs are
+answered Cancel unless you call `page_dialog(action='accept')` first. Action
+results report new tabs, dialogs and downloads; files land in `page_downloads`.
+Browser slots are shared with every other Claude window on this machine.
+
 To understand how a page builds a request (a signature, token or nonce):
 `js_search` to find the code, `js_hook` to record calls with their stacks,
 `js_breakpoint(kind='xhr')` to stop where a request is built, then
@@ -64,6 +82,8 @@ async def lifespan(_server: MCPServer) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        global _shutting_down
+        _shutting_down = True
         await app.stop()
         set_app(None)
 
@@ -81,6 +101,52 @@ def build_server() -> MCPServer:
     return mcp
 
 
+def _raise_fd_limit(target: int = 4096) -> None:
+    """Lift the soft open-file limit where the OS default is tiny.
+
+    macOS gives processes started from a GUI app or launchd a soft limit of 256.
+    Each lease holds a CDP websocket plus body files being written, and the
+    local provider adds Chromium pipes, so a handful of parallel leases can hit
+    "Too many open files". The hard limit is untouched.
+    """
+    try:
+        import resource
+    except ImportError:  # Windows
+        return
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        want = target if hard == resource.RLIM_INFINITY else min(target, hard)
+        if soft != resource.RLIM_INFINITY and soft < want:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
+    except (ValueError, OSError) as exc:
+        log.debug("could not raise RLIMIT_NOFILE: %s", exc)
+
+
+def _install_signal_handlers() -> None:
+    """Turn SIGTERM/SIGHUP into the same orderly shutdown as Ctrl-C.
+
+    MCP clients on macOS and Linux end a server with SIGTERM (or SIGHUP when a
+    terminal closes). The default action kills the process on the spot, so the
+    lifespan never runs ``app.stop()`` and every lease keeps billing until the
+    reaper of the next run -- or the platform timeout -- catches it.
+    """
+    if os.name != "posix":
+        return
+
+    def forward(_signum: int, _frame: object) -> None:
+        # The usual sequence from an MCP client is: close stdin (shutdown
+        # starts), then SIGTERM two seconds later. Turning that SIGTERM into a
+        # second interrupt would cancel the shutdown that is already stopping
+        # cloud browsers, so once it has started, let it run.
+        if _shutting_down:
+            return
+        signal.raise_signal(signal.SIGINT)
+
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        with contextlib.suppress(ValueError, OSError):
+            signal.signal(sig, forward)
+
+
 def main() -> int:
     settings = get_settings()
     setup_logging(settings.log_level)
@@ -92,6 +158,8 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
+    _raise_fd_limit()
+    _install_signal_handlers()
     try:
         build_server().run()
     except KeyboardInterrupt:

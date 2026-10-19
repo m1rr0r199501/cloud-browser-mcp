@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any
 
 from .errors import LeaseExpired, LeaseNotActive, ToolTimeout
 from .scope import ScopeRule
-from .store import ST_ACTIVE
+from .store import ST_ACTIVE, ST_CREATING
 
 if TYPE_CHECKING:
     from .session import BrowserSession
@@ -52,6 +52,9 @@ class Lease:
     release_reason: str | None = None
     inflight: int = 0
     tool_calls: int = 0
+    # The task creating this lease's browser, while state is "creating". A
+    # release that arrives mid-creation waits on it instead of racing it.
+    creation_task: asyncio.Task | None = field(default=None, repr=False)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
     # ----- clocks ----------------------------------------------------------
@@ -93,12 +96,7 @@ class Lease:
         may block for a minute waiting for a breakpoint, and holding the lock
         there would deadlock the very ``js_step`` call needed to release it.
         """
-        if self.state != ST_ACTIVE:
-            if self.release_reason in ("idle_timeout", "max_lifetime", "platform_timeout"):
-                raise LeaseExpired(
-                    f"lease {self.lease_id} was reclaimed ({self.release_reason})"
-                )
-            raise LeaseNotActive(f"lease {self.lease_id} is {self.state}, not active")
+        self._require_active()
 
         self.inflight += 1
         self.tool_calls += 1
@@ -118,6 +116,9 @@ class Lease:
                     hint="Wait for it, or release this lease and acquire a new browser.",
                 ) from exc
             try:
+                # The wait for the lock can outlast the lease: the reaper may
+                # have released it while this call queued behind another one.
+                self._require_active()
                 self.touch()
                 yield self
                 self.touch()
@@ -125,6 +126,25 @@ class Lease:
                 self._lock.release()
         finally:
             self.inflight -= 1
+
+    def _require_active(self) -> None:
+        if self.state == ST_CREATING:
+            # Not "no longer usable -- acquire a fresh one": that advice made
+            # agents buy a second browser while the first was still starting.
+            raise LeaseNotActive(
+                f"lease {self.lease_id} is still starting",
+                hint=(
+                    "The browser is not ready yet. Wait a few seconds and retry this "
+                    "call (or poll browser_queue_status with your ticket_id). Do NOT "
+                    "call browser_acquire for another browser."
+                ),
+            )
+        if self.state != ST_ACTIVE:
+            if self.release_reason in ("idle_timeout", "max_lifetime", "platform_timeout"):
+                raise LeaseExpired(
+                    f"lease {self.lease_id} was reclaimed ({self.release_reason})"
+                )
+            raise LeaseNotActive(f"lease {self.lease_id} is {self.state}, not active")
 
     # ----- views -----------------------------------------------------------
 
