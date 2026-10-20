@@ -93,7 +93,11 @@ class Settings(BaseSettings):
 
     # --- concurrency -------------------------------------------------------
     max_concurrency: int = Field(default=6, ge=1, le=200)
-    acquire_block_seconds: float = Field(default=25.0, ge=0.0, le=120.0)
+    # Measured from a distant client: cloud browsers took 3-52s to be drivable
+    # (median 11-20s). 25s handed out a ticket for many requests that had a free
+    # slot. Claude Code's MCP tool timeout is ~28h, so waiting longer is safe;
+    # lower it for MCP clients with short tool timeouts.
+    acquire_block_seconds: float = Field(default=60.0, ge=0.0, le=120.0)
     queue_timeout_seconds: float = Field(default=600.0, ge=5.0)
     respect_platform_limit: bool = True
     # Every Claude Code window starts its own gateway. With this on (the
@@ -131,7 +135,11 @@ class Settings(BaseSettings):
     budget_enforce: bool = True
 
     # --- scope -------------------------------------------------------------
-    scope_mode: ScopeMode = "warn"
+    # enforce: an allow/deny list blocks (navigation, redirects, subresources).
+    # With no list there is nothing to enforce, so this costs nothing by
+    # default. Reported from real use: with "warn", a lease's scope_allow did
+    # not stop a redirect off the list, which is not what anyone expects.
+    scope_mode: ScopeMode = "enforce"
     # NoDecode: these arrive as comma-separated strings, not JSON. Without it
     # pydantic-settings tries json.loads() before the validator below can run,
     # and an empty value crashes startup.
@@ -149,6 +157,16 @@ class Settings(BaseSettings):
     max_screenshot_bytes: int = Field(default=1_500_000, ge=10_000)
 
     # --- browser defaults --------------------------------------------------
+    # Profile used when browser_acquire names none, so logins and cookies carry
+    # over between tasks. Empty = a clean browser every time. Only one browser
+    # can use a profile at once; parallel acquires get a clean browser instead.
+    default_profile: str = ""
+    # Browser Use saves a profile AFTER the browser is reported stopped, with
+    # no API signal for when it is done. Measured: a browser started 0s after
+    # the stop loaded the old state (and its own save could then overwrite the
+    # new one); 5s+ was fine; one first save took ~22s. The profile stays
+    # locked this long after a stop; the next acquire on it waits.
+    profile_save_seconds: float = Field(default=25.0, ge=0.0, le=300.0)
     screen_width: int = Field(default=1440, ge=320, le=6144)
     screen_height: int = Field(default=900, ge=320, le=3456)
     solve_captchas: bool = False

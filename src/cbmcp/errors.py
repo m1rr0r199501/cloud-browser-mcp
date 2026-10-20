@@ -37,7 +37,8 @@ class LeaseNotFound(CbmcpError):
     code = "lease_not_found"
     hint = (
         "The lease token is unknown. It may have been released or reclaimed. "
-        "Call browser_acquire to get a new one. Do not reuse or guess tokens."
+        "Pass the 'lease' value (lst_...) that browser_acquire returned, or call "
+        "browser_acquire to get a new one. Do not reuse or guess tokens."
     )
 
 
@@ -57,6 +58,15 @@ class LeaseExpired(CbmcpError):
 class CapacityExhausted(CbmcpError):
     code = "capacity_exhausted"
     hint = "All browser slots are busy. Poll browser_queue_status with your ticket_id."
+
+
+class ProfileInUse(CbmcpError):
+    code = "profile_in_use"
+    hint = (
+        "Another browser is using this profile right now (one at a time, or the two "
+        "would overwrite each other's saved logins). Wait for it to be released, use "
+        "a different profile name, or omit `profile` for a clean browser."
+    )
 
 
 class BudgetExceeded(CbmcpError):
@@ -106,6 +116,16 @@ class ProviderConcurrencyLimit(ProviderQuotaError):
 class BrowserConnectionError(CbmcpError):
     code = "browser_connection_error"
     hint = "The browser connection broke. Release this lease and acquire a new one."
+
+
+class BrowserConnectionLost(CbmcpError):
+    """Transient: the cloud browser is usually still running."""
+
+    code = "browser_connection_lost"
+    hint = (
+        "Retry the call: the gateway reconnects to the same browser (tabs, cookies and "
+        "logins are kept). If it keeps failing, release the lease and acquire a new browser."
+    )
 
 
 class DebuggerPaused(CbmcpError):

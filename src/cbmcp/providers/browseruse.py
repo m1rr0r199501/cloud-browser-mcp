@@ -7,6 +7,8 @@ Endpoints used, as documented at docs.browser-use.com (checked 2026-10):
     GET    /api/v4/browsers/{id}       -> single session
     PATCH  /api/v4/browsers/{id}       -> {"action":"stop"}
     GET    /api/v2/billing/account     -> concurrentSessionLimit, activeSessionCount
+    POST   /api/v4/profiles            -> ProfileView (id); 402 = profile limit
+    DELETE /api/v4/profiles/{id}       -> 204
 
 Auth is the raw key in ``X-Browser-Use-API-Key`` -- no ``Bearer`` prefix.
 
@@ -57,6 +59,8 @@ class BrowserUseProvider:
     name = "browseruse"
     supports_profiles = True
     supports_custom_proxy = True
+    # The profile is written back some seconds after the browser stops.
+    saves_profile_after_stop = True
 
     def __init__(
         self,
@@ -298,6 +302,37 @@ class BrowserUseProvider:
     async def confirm_stopped(self, session_id: str) -> bool:
         session = await self.get_session(session_id)
         return session is None or session.status == "stopped"
+
+    # ----- profiles --------------------------------------------------------
+    # POST /api/v4/profiles {name} -> ProfileView{id, ...}; DELETE /api/v4/profiles/{id}.
+    # A browser created with profileId starts with the saved cookies and
+    # storage; the platform saves the state back when that browser stops.
+
+    async def create_profile(self, name: str) -> str:
+        try:
+            data = await self._request(
+                "POST", "/api/v4/profiles", json_body={"name": name}, retries=0
+            )
+        except ProviderQuotaError as exc:
+            # 402 on this endpoint means the plan's profile limit, not credits.
+            raise ProviderQuotaError(
+                "Browser Use refused to create a profile: the account's profile limit "
+                "is reached",
+                hint="Delete an unused profile with browser_profiles(action='delete').",
+            ) from exc
+        if not isinstance(data, dict) or not data.get("id"):
+            raise ProviderError(f"unexpected profile response shape: {str(data)[:200]}")
+        log.info("created profile %s (%s)", data["id"], name)
+        return str(data["id"])
+
+    async def delete_profile(self, profile_id: str) -> bool:
+        try:
+            await self._request("DELETE", f"/api/v4/profiles/{profile_id}")
+            return True
+        except ProviderError as exc:
+            if "not found" in str(exc).lower():
+                return True
+            raise
 
     async def account_info(self) -> AccountInfo:
         data = await self._request("GET", "/api/v2/billing/account")

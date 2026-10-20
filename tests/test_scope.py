@@ -89,6 +89,26 @@ def test_requesting_scope_turns_enforcement_on():
     assert not lease.permits("https://elsewhere.net")[0]
 
 
+def test_lease_allowlist_is_enforced_under_an_operator_warn_mode():
+    """Reported from real use: scope_allow under CBMCP_SCOPE_MODE=warn let
+    redirects leave the list. Naming an allowlist now means enforcing it."""
+    operator = global_scope("warn", [], [])
+    lease = operator.narrow(["example.com"], None, None)
+    assert lease.mode == "enforce"
+    with pytest.raises(ScopeViolation):
+        lease.enforce("https://elsewhere.net/")
+    # Asking for "warn" explicitly is still honoured (it is the operator's mode).
+    assert operator.narrow(["example.com"], None, "warn").mode == "warn"
+    # No allowlist on the lease: the operator's mode stands.
+    assert operator.narrow(None, None, None).mode == "warn"
+
+
+def test_default_scope_mode_is_enforce():
+    from cbmcp.config import Settings
+
+    assert Settings.model_fields["scope_mode"].default == "enforce"
+
+
 def test_unrestricted_scope_permits_everything():
     rule = global_scope("off", [], [])
     assert rule.restricted is False

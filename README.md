@@ -171,7 +171,35 @@ and third-party includes all reach hosts the agent never typed:
 browser_acquire(task_label="audit", scope_allow=["example.com", "*.cdn.example.com"])
 ```
 
-A lease can only ever narrow `CBMCP_SCOPE_ALLOW`, never widen it.
+A lease can only ever narrow `CBMCP_SCOPE_ALLOW`, never widen it. A lease that
+names `scope_allow` is enforced (blocked, not just logged) unless it asks for
+`scope_mode="warn"`, and `CBMCP_SCOPE_MODE` defaults to `enforce`. With no
+allowlist at all nothing is restricted, so the default costs nothing.
+
+### Persistent profiles
+
+Every browser is clean by default. When a task needs to stay logged in, name a
+profile:
+
+```python
+browser_acquire(task_label="inbox", profile="main")   # created on first use
+```
+
+Cookies, logins and local storage saved by earlier browsers on `main` are
+loaded, and this browser's state is saved back when it is released. Set
+`CBMCP_DEFAULT_PROFILE=main` to use it whenever an acquire names none.
+`browser_profiles` lists, creates and deletes profiles.
+
+One browser per profile at a time, across every Claude window on the machine
+(a lock in the shared database): two browsers saving one profile would
+overwrite each other's logins. An explicit `profile` that is busy fails with
+`profile_in_use`; the default profile falls back to a clean browser instead.
+Browser Use writes a profile back some seconds *after* the browser stops, with
+no API signal for when it is done — measured, a browser started at once loaded
+the old state — so the profile stays locked for `CBMCP_PROFILE_SAVE_SECONDS`
+(25s) after a stop, and an acquire in that window waits for the save. With the
+local provider a profile is a kept Chrome user-data-dir under
+`<data dir>/profiles`, and Chrome is shut down cleanly so its cookies reach disk.
 
 Two tools are confined for the same prompt-injection reason. `page_upload`
 only sends files from `CBMCP_UPLOAD_DIR` (default `<data dir>/uploads`), so a
@@ -183,11 +211,11 @@ use `cbmcp stop <id>` for anything else on the account.
 
 ## Tools
 
-49 tools in six groups. Set `CBMCP_ENABLE_DEBUGGER_TOOLS=false` or
+50 tools in six groups. Set `CBMCP_ENABLE_DEBUGGER_TOOLS=false` or
 `CBMCP_ENABLE_ADMIN_TOOLS=false` to trim the agent's tool list and context.
 
-**Lease (5)** · `browser_acquire` `browser_queue_status` `browser_release`
-`browser_status` `browser_renew`
+**Lease (6)** · `browser_acquire` `browser_queue_status` `browser_release`
+`browser_status` `browser_renew` `browser_profiles`
 
 **Page (16)** · `page_navigate` `page_tabs` `page_click` `page_type`
 `page_select` `page_press` `page_scroll` `page_wait` `page_upload`
@@ -401,15 +429,34 @@ daily usage and the audit trail.
 
 From the runs above, so expectations are calibrated:
 
-- **Cold start is 8–47 seconds** (median ~10s, worst observed 47s). This is why
-  `browser_acquire` blocks for a bounded `CBMCP_ACQUIRE_BLOCK_SECONDS` (25s,
-  comfortably under the MCP client's tool timeout) and then hands back a ticket.
-  Fulfilment continues in the background, so the lease is usually ready the
-  moment the agent polls `browser_queue_status`. The ticket — not the caller —
-  owns the slot, so a client timeout cannot leak one.
-- **A 20-second lease costs about $0.00033** at the documented $0.02/hour.
-  Browser time is cheap; the real risks are a forgotten session and proxy
-  bandwidth, which is why `direct` is the default egress.
+- **Cold start is 3–52 seconds** depending on how far the client is from the
+  platform (median 11–20s measured from a distant client, ~2s nearby). This is
+  why `browser_acquire` blocks for a bounded `CBMCP_ACQUIRE_BLOCK_SECONDS` (60s;
+  Claude Code's tool timeout is ~28h) and then hands back a ticket. Fulfilment
+  continues in the background, so the lease is usually ready the moment the
+  agent polls `browser_queue_status`. The ticket — not the caller — owns the
+  slot, so a client timeout cannot leak one. The CDP connect is retried (3 ×
+  40s) because a first attempt occasionally hangs.
+- **Connections drop and come back.** The cloud browser outlives our websocket
+  to it (a Mac asleep, a network change). The gateway reconnects to the same
+  browser — tabs (with their ids), page state, cookies, logins and hooks kept;
+  breakpoints and emulation settings are not — on the next tool call or reaper
+  sweep, before giving up on a lease. Measured on Browser Use: 1.9s. A call
+  that was cut off mid-way returns `browser_connection_lost`: retry it.
+- **Error pages are not responses.** A 403 with an empty body makes Chrome show
+  its own ~250 KB error page. `page_navigate`, `page_text`, `page_html` and
+  `net_request` say `browser_error_page: true` instead of passing that page off
+  as the site's answer.
+- **Sites throttle.** When most recent page/API responses are 403/429/503,
+  `page_navigate` and `net_requests` add a `rate_limit_warning`.
+- **A 20-second lease costs about $0.00033** at the documented $0.02/hour
+  (billed per started minute). Browser time is cheap; the real risks are a
+  forgotten session and proxy bandwidth, which is why `direct` is the default.
+  Note that `direct` means *no billed proxy*, not a direct connection: Browser
+  Use still routes traffic through its own network (CDP shows a private 10.x
+  next hop and HTTP/1.1). `browser_status(check_network=true)` reports the real
+  egress IP and protocol — measured: an AWS us-east-2 address, different for
+  each browser, HTTP/2 to the site.
 - Account concurrency quota observed: 10. `CBMCP_MAX_CONCURRENCY` is clamped to
   it automatically.
 
@@ -438,7 +485,7 @@ to release, pausing past the idle timeout, renewing before a pause, retrying
 closed mid-task, one crashes, one is opened afterwards, and peak demand exceeds
 the ceiling of 6. It runs on its own throwaway data dir.
 
-Last run against Browser Use: 117/117 checks, peak 6 browsers for a ceiling of
+Last run against Browser Use: 119/119 checks, peak 6 browsers for a ceiling of
 6, the crashed window's browsers stopped 18s after the crash (as soon as the
 next window opened), nothing left running.
 
@@ -508,12 +555,14 @@ unit tests, and are worth knowing about if you extend the hook runtime:
 - **No browser reuse between leases.** Considered and rejected: handing a used
   browser to another agent would carry cookies, storage and login state across,
   which breaks the isolation guarantee for a few cents of saved cold start.
+  State carries over only when a task asks for it, through a named profile.
 - **`customProxy` is host/port/user/pass**; whether a given SOCKS5 endpoint works
   is the platform's behaviour, not something this gateway can determine. Test it
   with `CBMCP_NETWORK_MODE=custom_proxy` and `cbmcp check` before relying on it.
-- **Persistent profiles** are supported by passing `profile_id` through, but no
-  profile locking is implemented — using one profile from two leases at once is
-  not prevented. Throwaway sessions are the default and the tested path.
+- **Profiles are one browser at a time.** Parallel subagents that all need the
+  same login must take turns (or use one profile each). The 25s save hold is a
+  measured margin, not a platform guarantee; raise
+  `CBMCP_PROFILE_SAVE_SECONDS` if a profile ever comes back stale.
 - **Sensitive data reaches the model.** `page_eval` results, network bodies,
   hook records and screenshots all enter the agent's context, and therefore the
   model provider's logs. Traffic also transits Browser Use's infrastructure.

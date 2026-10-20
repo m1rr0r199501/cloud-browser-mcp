@@ -7,8 +7,9 @@ from typing import Any
 from mcp.server.mcpserver import MCPServer
 
 from ..app import get_app
+from ..errors import InvalidArgument
 from ..pool import AcquireRequest
-from ._common import guarded
+from ._common import guarded, use_lease
 
 ACQUIRE_DOC = """Rent a cloud browser for this task. Returns a lease token.
 
@@ -33,6 +34,12 @@ The lease is reclaimed automatically if you stop using it (idle timeout), so a
 crashed or cancelled agent cannot leave a browser running. Long analysis
 between calls should call browser_renew.
 
+`profile` keeps browser state between tasks: pass a name (e.g. "main") and
+cookies, logins and local storage saved by earlier browsers on that profile
+are loaded; this browser's state is saved back when it is released. Created on
+first use. One browser per profile at a time (error profile_in_use otherwise).
+Omit it for a clean browser.
+
 `debug` controls instrumentation:
   "full"  (default) breakpoints, call stacks, scope inspection, hooks
   "hooks" function hooks only -- no Runtime.enable/Debugger.enable, so less
@@ -52,6 +59,7 @@ def register(mcp: MCPServer) -> None:
         lease_seconds: float | None = None,
         debug: str | None = None,
         network_mode: str | None = None,
+        profile: str | None = None,
         profile_id: str | None = None,
         screen_width: int | None = None,
         screen_height: int | None = None,
@@ -72,8 +80,11 @@ def register(mcp: MCPServer) -> None:
             debug: "full" | "hooks" | "off" (see the tool description).
             network_mode: "direct" | "platform_proxy" | "custom_proxy", only if
                 the operator permits per-lease choice.
-            profile_id: Persistent cloud browser profile, for tasks that need a
-                saved login. Omit for a clean throwaway browser (the default).
+            profile: Name of a persistent profile (letters, digits, . _ - @),
+                for tasks that need saved logins or cookies. Created on first
+                use. Omit for a clean throwaway browser.
+            profile_id: A provider profile id made outside this server (e.g. in
+                the Browser Use dashboard). Prefer `profile`.
             screen_width: Viewport width in pixels.
             screen_height: Viewport height in pixels.
             solve_captchas: Let the platform attempt CAPTCHA solving.
@@ -86,6 +97,7 @@ def register(mcp: MCPServer) -> None:
             scope_allow=scope_allow,
             scope_deny=scope_deny,
             lease_seconds=lease_seconds,
+            profile=profile,
             profile_id=profile_id,
             debug=debug,
             screen_width=screen_width,
@@ -144,7 +156,7 @@ def register(mcp: MCPServer) -> None:
     async def browser_release(lease: str, reason: str | None = None) -> dict[str, Any]:
         """
         Args:
-            lease: The lease token from browser_acquire.
+            lease: The lease token from browser_acquire (lst_..., not lease_id).
             reason: Optional note for the audit record.
         """
         app = get_app()
@@ -153,26 +165,67 @@ def register(mcp: MCPServer) -> None:
     @mcp.tool(
         description=(
             "Lease state: time left, idle countdown, pages, captured network/hook "
-            "counts and cost so far. Omit `lease` for a server-wide summary."
+            "counts and cost so far. Omit `lease` for a server-wide summary. "
+            "check_network=true also reports how this browser really reaches the "
+            "internet: egress IP, country, HTTP protocol (the platform routes even "
+            "'direct' traffic through its own network)."
         )
     )
     @guarded
-    async def browser_status(lease: str | None = None) -> dict[str, Any]:
+    async def browser_status(
+        lease: str | None = None, check_network: bool = False
+    ) -> dict[str, Any]:
         """
         Args:
-            lease: Lease token to inspect. Omit for a summary of the whole server.
+            lease: The lease token (lst_...) to inspect. Omit for a server-wide summary.
+            check_network: Open a short-lived tab to report the egress IP and protocol.
         """
         app = get_app()
         if lease:
             obj = app.P.resolve_token(lease)
             obj.touch()
-            return {"ok": True, **obj.public(include_session=True)}
+            out = {"ok": True, **obj.public(include_session=True)}
+            if check_network:
+                async with use_lease(lease) as (_, session):
+                    out["network_check"] = await session.network_info()
+            return out
         return {
             "ok": True,
             "pool": app.P.stats(),
             "budget": await app.B.snapshot(),
             "leases": [x.public(include_session=False) for x in app.P.live_leases()],
         }
+
+    @mcp.tool(
+        description=(
+            "Manage persistent browser profiles (saved cookies, logins, local storage). "
+            "action='list' shows each profile and whether a browser is using it; "
+            "'create' makes one ahead of time (browser_acquire(profile=...) also "
+            "creates on first use); 'delete' removes one and its saved state for good."
+        )
+    )
+    @guarded
+    async def browser_profiles(action: str = "list", name: str | None = None) -> dict[str, Any]:
+        """
+        Args:
+            action: "list" | "create" | "delete".
+            name: Profile name, for create and delete.
+        """
+        app = get_app()
+        if action == "list":
+            profiles = await app.P.list_profiles()
+            return {
+                "ok": True,
+                "profiles": profiles,
+                "default_profile": app.s.default_profile or None,
+            }
+        if action not in ("create", "delete") or not name:
+            raise InvalidArgument(
+                "use action='list', or action='create'/'delete' with a name",
+            )
+        if action == "create":
+            return {"ok": True, "status": "ready", "profile": await app.P.create_profile(name)}
+        return {"ok": True, **await app.P.delete_profile(name.strip())}
 
     @mcp.tool(
         description=(

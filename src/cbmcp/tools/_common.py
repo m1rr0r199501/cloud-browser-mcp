@@ -23,7 +23,13 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from ..app import get_app
-from ..errors import CbmcpError, InvalidArgument, LeaseNotActive
+from ..errors import (
+    BrowserConnectionError,
+    BrowserConnectionLost,
+    CbmcpError,
+    InvalidArgument,
+    LeaseNotActive,
+)
 from ..lease import Lease
 from ..log import get_logger
 from ..session import BrowserSession
@@ -58,15 +64,53 @@ def guarded(fn):
     return wrapper
 
 
+_DROP_MARKERS = (
+    "has been closed",
+    "connection closed",
+    "target closed",
+    "browser closed",
+    "websocket",
+    "disconnected",
+)
+
+
+def _is_connection_drop(exc: BaseException) -> bool:
+    if type(exc).__module__.split(".")[0] != "playwright":
+        return False
+    text = str(exc).lower()
+    return any(marker in text for marker in _DROP_MARKERS)
+
+
 @asynccontextmanager
 async def use_lease(lease: str, *, exclusive: bool = True, timeout: float = 180.0):
     """Resolve a lease token and hold its guard for the duration of a tool call."""
     app = get_app()
     obj: Lease = app.P.resolve_token(lease)
+    if obj.session is not None and obj.state == "active" and not obj.session.is_connected():
+        # Connection dropped since the last call: restore it before acting
+        # rather than failing the call (and the agent's task).
+        if not await app.P.reconnect(obj, why="tool call"):
+            raise BrowserConnectionError(
+                f"lease {obj.lease_id}: the connection to the cloud browser was lost and "
+                "could not be restored",
+                hint="Release this lease and acquire a new browser.",
+            )
     async with obj.guard(exclusive=exclusive, timeout=timeout):
         if obj.session is None:
             raise LeaseNotActive(f"lease {obj.lease_id} has no live browser")
-        yield obj, obj.session
+        session = obj.session
+        try:
+            yield obj, session
+        except Exception as exc:
+            # The websocket to the cloud browser went away mid-call. The browser
+            # itself usually still runs; the next call reconnects. (A closed
+            # page with the connection intact is a different error -- let it
+            # through as is.)
+            if _is_connection_drop(exc) and not session.is_connected():
+                raise BrowserConnectionLost(
+                    f"the connection to the cloud browser dropped: {str(exc)[:200]}"
+                ) from exc
+            raise
 
 
 def clip(text: str, limit: int, *, offset: int = 0, label: str = "text") -> dict[str, Any]:
@@ -85,6 +129,56 @@ def clip(text: str, limit: int, *, offset: int = 0, label: str = "text") -> dict
 
 def page_arg(session: BrowserSession, page: str | None):
     return session.handle(page)
+
+
+def page_condition_flags(
+    session: BrowserSession,
+    handle: Any,
+    *,
+    url: str | None = None,
+    html: str | None = None,
+    response_missing: bool = False,
+) -> dict[str, Any]:
+    """What a person would notice about the page that its content hides.
+
+    * The browser showing its OWN error page (``chrome-error://``): measured, a
+      403 with an empty body made page_text return Chrome's "HTTP ERROR 403"
+      text and net_body a 180 KB Chrome page -- easy to record as the site's.
+      Pass ``url`` as read inside the page (``location.href``) when available:
+      right after a navigation Playwright still reports the requested URL.
+    * The site answering 403/429/503 in bulk (rate limiting / blocking).
+    """
+    out: dict[str, Any] = {}
+    url = url or getattr(handle.page, "url", "") or ""
+    nav = session.netlog.last_navigation()
+    is_error = url.startswith("chrome-error://") or (
+        html is not None and 'id="main-frame-error"' in html[:400_000]
+    )
+    # Measured: a navigation answered 403 with an empty body yields no response
+    # object at all, while the network log has the 403 -- the browser has
+    # replaced the page with its own error page.
+    if response_missing and nav is not None and (
+        (nav.status or 0) >= 400 or nav.failure
+    ):
+        is_error = True
+    if is_error:
+        out["browser_error_page"] = True
+        if nav is not None:
+            out["status"] = nav.status
+            out["failed_url"] = nav.url
+            if nav.failure:
+                out["network_error"] = nav.failure
+        out["error_page_note"] = (
+            "The browser is showing its OWN error page"
+            + (f" for HTTP {nav.status}" if nav is not None and nav.status else "")
+            + ", not the site's content: the site sent no usable body or the request "
+            "failed. page_text / page_html / page_snapshot return Chrome's error text "
+            "here; do not record it as the site's response."
+        )
+    hint = session.netlog.throttle_hint()
+    if hint:
+        out["rate_limit_warning"] = hint
+    return out
 
 
 def require_one(**options: Any) -> None:

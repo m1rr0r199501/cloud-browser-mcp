@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import ipaddress
 import json
 import time
 from collections import OrderedDict, deque
@@ -75,6 +76,32 @@ def _is_textual(content_type: str) -> bool:
     return any(marker in ct for marker in _TEXTUAL)
 
 
+_CHROME_ERROR_MARKERS = (b'id="main-frame-error"', b'class="neterror"', b"chrome-error://")
+
+
+def _is_browser_error_page(entry: NetEntry, raw: bytes) -> bool:
+    """Did Chromium hand back its own error page instead of the server's body?"""
+    if entry.status is not None and entry.status < 400:
+        return False
+    declared = entry.response_headers.get("content-length")
+    if declared is not None and declared.strip() == "0" and raw:
+        return True
+    head = raw[:600_000]
+    return any(marker in head for marker in _CHROME_ERROR_MARKERS)
+
+
+_BLOCK_STATUSES = (403, 429, 503)
+
+
+def _is_private_ip(ip: str | None) -> bool:
+    if not ip:
+        return False
+    try:
+        return ipaddress.ip_address(ip.strip("[]")).is_private
+    except ValueError:
+        return False
+
+
 @dataclass
 class NetEntry:
     id: str
@@ -102,6 +129,7 @@ class NetEntry:
     ended_at: float | None = None
     redirected_from: str | None = None
     server_ip: str | None = None
+    browser_error_page: bool = False
 
     @property
     def duration_ms(self) -> int | None:
@@ -110,7 +138,7 @@ class NetEntry:
         return int((self.ended_at - self.started_at) * 1000)
 
     def summary(self) -> dict[str, Any]:
-        return {
+        out = {
             "id": self.id,
             "method": self.method,
             "url": self.url if len(self.url) <= 300 else self.url[:300] + "...",
@@ -123,6 +151,9 @@ class NetEntry:
             "has_body": bool(self.body_path),
             "has_post_data": bool(self.post_data),
         }
+        if self.browser_error_page:
+            out["browser_error_page"] = True
+        return out
 
     def detail(self, redact: bool) -> dict[str, Any]:
         def headers(src: dict[str, str]) -> dict[str, str]:
@@ -152,6 +183,18 @@ class NetEntry:
             "mime_type": self.mime_type,
             "from_cache": self.from_cache,
             "server_ip": self.server_ip,
+            **(
+                {
+                    "server_ip_note": (
+                        "A private address: the browser's next network hop inside the "
+                        "cloud platform, not the site. The platform routes all traffic "
+                        "through its own network, also in 'direct' mode. "
+                        "browser_status(check_network=true) shows the real egress IP."
+                    )
+                }
+                if _is_private_ip(self.server_ip)
+                else {}
+            ),
             "redirected_from": self.redirected_from,
             "failure": self.failure,
             "body": {
@@ -160,6 +203,7 @@ class NetEntry:
                 "truncated": self.body_truncated,
                 "base64": self.body_is_base64,
                 "error": self.body_error,
+                "browser_error_page": self.browser_error_page or None,
                 "read_with": f"net_body(id='{self.id}')" if self.body_path else None,
             },
         }
@@ -258,6 +302,8 @@ class NetworkRecorder:
         self._tasks: set[asyncio.Task] = set()
         self.dropped = 0
         self.blocked: deque[dict[str, Any]] = deque(maxlen=200)
+        # Statuses of recent page/API responses, to notice a site throttling us.
+        self._recent_status: deque[int] = deque(maxlen=20)
 
     # ----- lifecycle -------------------------------------------------------
 
@@ -366,6 +412,8 @@ class NetworkRecorder:
             entry.status_text = response.status_text
             entry.response_headers = dict(response.headers or {})
             entry.mime_type = entry.response_headers.get("content-type", "")
+            if entry.resource_type in ("document", "xhr", "fetch"):
+                self._recent_status.append(int(entry.status or 0))
             # server_addr() and body() are both coroutines, and this handler is
             # synchronous, so the async follow-up runs as its own task.
             self._spawn(self._finalise_response(entry, response))
@@ -443,6 +491,19 @@ class NetworkRecorder:
             return
         if raw is None:
             entry.body_error = "empty"
+            return
+        if _is_browser_error_page(entry, raw):
+            # Measured: for a 403 with Content-Length: 0, response.body() returns
+            # Chrome's own ~180 KB "HTTP ERROR 403" page. Storing that as the
+            # response body would have agents record the browser's words as
+            # the site's.
+            declared = entry.response_headers.get("content-length")
+            entry.browser_error_page = True
+            entry.body_error = (
+                f"not the server's response: the browser substituted its own error page "
+                f"({len(raw)} bytes) for an HTTP {entry.status} response whose body was "
+                + (f"{declared} bytes long" if declared is not None else "empty")
+            )
             return
         data = raw
         if len(data) > self.max_body_bytes:
@@ -566,6 +627,31 @@ class NetworkRecorder:
                 "the initiator buffer wrapped; this is the most recent one for this URL"
             )
         return view
+
+    def throttle_hint(self) -> str | None:
+        """Is the site answering with 403/429/503 in bulk? Then say so.
+
+        Reported from real use: after ~150 requests a target answered 403 to
+        everything, and the agent kept going. The pattern is visible here long
+        before it is visible to an agent reading one response at a time.
+        """
+        recent = list(self._recent_status)[-12:]
+        if len(recent) < 6 or recent[-1] not in _BLOCK_STATUSES:
+            return None
+        blocked = sum(1 for s in recent if s in _BLOCK_STATUSES)
+        if blocked < max(5, int(len(recent) * 0.6)):
+            return None
+        return (
+            f"{blocked} of the last {len(recent)} page/API responses were HTTP 403/429/503: "
+            "the site is very likely rate-limiting or blocking this browser. Slow down or "
+            "stop -- further requests will probably get the same answer."
+        )
+
+    def last_navigation(self) -> NetEntry | None:
+        for entry in reversed(self._entries.values()):
+            if entry.is_navigation or entry.resource_type == "document":
+                return entry
+        return None
 
     def note_blocked(self, url: str, reason: str) -> None:
         self.blocked.append({"ts": time.time(), "url": url[:300], "reason": reason})
