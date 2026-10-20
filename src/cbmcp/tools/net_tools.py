@@ -85,6 +85,15 @@ def register(mcp: MCPServer) -> None:
                 )
             if session.netlog.blocked:
                 out["scope_blocked"] = list(session.netlog.blocked)[-10:]
+            hint = session.netlog.throttle_hint()
+            if hint:
+                out["rate_limit_warning"] = hint
+            if any(e.browser_error_page for e in entries):
+                out["browser_error_page_note"] = (
+                    "Entries marked browser_error_page got an error status with no usable "
+                    "body; the browser showed its own error page, which is NOT stored as "
+                    "their body."
+                )
             return out
 
     @mcp.tool(

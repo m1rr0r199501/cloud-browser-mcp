@@ -43,9 +43,11 @@ Rules that matter:
 * A cloud browser bills for wall-clock time. Acquire late, release early. Only
   acquire one when plain HTTP requests will not do -- when you need JavaScript
   execution, dynamic rendering, a login flow, or network/JS debugging.
-* Every browser tool needs the `lease` token from `browser_acquire`. There is no
-  implicit "current browser": this server runs many agents' browsers at once and
-  the token is what keeps them apart. Never share or guess a token.
+* Every browser tool needs the `lease` token from `browser_acquire` (it starts
+  with `lst_`; `lease_id`, starting `lse_`, is only a label and is refused).
+  There is no implicit "current browser": this server runs many agents'
+  browsers at once and the token is what keeps them apart. Never share or
+  guess a token.
 * If `browser_acquire` returns status="queued", poll `browser_queue_status` with
   the ticket. Do not call `browser_acquire` again -- that can start a second
   paid session.
@@ -54,6 +56,12 @@ Rules that matter:
   stop. Call `browser_renew` before a long stretch of analysis.
 * Work only on hosts you are authorised to test. A lease can be pinned to a host
   allowlist with `scope_allow`, enforced on every request.
+* `browser_acquire(profile="name")` keeps cookies, logins and local storage
+  between browsers: the state is saved when the browser is released and comes
+  back the next time that profile is used. One browser per profile at a time.
+* `error="browser_connection_lost"` is transient: the gateway reconnects to the
+  same cloud browser on the next call, so retry the call. A `rate_limit_warning`
+  means the site is throttling this browser -- slow down instead of retrying.
 
 Drive the page the way a person would: `page_snapshot` for refs, then
 `page_click` / `page_type` / `page_hover` / `page_drag`; `page_mouse` clicks

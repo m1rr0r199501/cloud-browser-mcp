@@ -14,7 +14,7 @@ from playwright.async_api import TimeoutError as PwTimeout
 
 from ..app import get_app
 from ..errors import InvalidArgument, ScopeViolation, ToolTimeout
-from ._common import guarded, require_one, use_lease
+from ._common import guarded, page_condition_flags, require_one, use_lease
 
 
 def _clean(exc: object) -> str:
@@ -95,7 +95,14 @@ def _flag_http_error(state: dict[str, Any], status: int | None) -> None:
         state["warning"] = f"The site answered HTTP {status}; this is an error page."
 
 
-async def _page_state(session, handle, *, note: str | None = None) -> dict[str, Any]:
+async def _page_state(
+    session,
+    handle,
+    *,
+    note: str | None = None,
+    check_error_page: bool = False,
+    response_missing: bool = False,
+) -> dict[str, Any]:
     state: dict[str, Any] = {"ok": True, "page": handle.id, "url": handle.page.url}
     try:
         state["title"] = await handle.page.title()
@@ -104,6 +111,18 @@ async def _page_state(session, handle, *, note: str | None = None) -> dict[str, 
     blocked = list(session.netlog.blocked)[-3:]
     if blocked:
         state["scope_blocked_recent"] = blocked
+    href = None
+    if check_error_page:
+        # Right after a failed navigation Playwright still reports the
+        # requested URL; the document itself knows it is chrome-error://.
+        with contextlib.suppress(PwError, PwTimeout, TimeoutError):
+            async with asyncio.timeout(5):
+                href = await handle.page.evaluate("location.href")
+    state.update(
+        page_condition_flags(session, handle, url=href, response_missing=response_missing)
+    )
+    if state.get("browser_error_page") and state.get("status"):
+        _flag_http_error(state, state["status"])
     # What a person would notice after an action: a new tab, a dialog, a file.
     opened = session.take_new_pages()
     if opened:
@@ -192,7 +211,7 @@ def register(mcp: MCPServer) -> None:
                         "still have partially loaded -- check page_snapshot.",
                     ) from exc
                 except PwError as exc:
-                    return {
+                    failed: dict[str, Any] = {
                         "ok": False,
                         "error": "navigation_failed",
                         "message": _clean(exc),
@@ -200,7 +219,27 @@ def register(mcp: MCPServer) -> None:
                         "hint": "Check net_requests(only_failed=true) for the underlying "
                         "network error, and whether scope blocked it.",
                     }
-                state = await _page_state(session, handle, note=note)
+                    if "ERR_HTTP_RESPONSE_CODE_FAILURE" in str(exc):
+                        # Measured: an HTTP error with an empty body. Say what
+                        # happened in words, and that the tab now shows Chrome's
+                        # own error page, not anything the site sent.
+                        failed.update(page_condition_flags(session, handle, url="chrome-error://"))
+                        status = failed.get("status")
+                        failed["message"] = (
+                            f"The site answered HTTP {status or '4xx/5xx'} with an empty body. "
+                            "The tab now shows the browser's own error page."
+                        )
+                        if status:
+                            _flag_http_error(failed, status)
+                    return failed
+                suspicious = response is None or response.status >= 400
+                state = await _page_state(
+                    session,
+                    handle,
+                    note=note,
+                    check_error_page=suspicious,
+                    response_missing=response is None,
+                )
                 if response is not None:
                     state["status"] = response.status
                     state["final_url"] = response.url
@@ -245,7 +284,11 @@ def register(mcp: MCPServer) -> None:
                         await page_obj.wait_for_load_state(
                             wait_until, timeout=min(timeout, 15_000)
                         )
-            state = await _page_state(session, handle)
+            state = await _page_state(
+                session,
+                handle,
+                check_error_page=response is None or response.status >= 400,
+            )
             if action != "reload" and response is None and page_obj.url == before:
                 state["note"] = f"No {action} history entry; the page did not change."
             if response is not None:

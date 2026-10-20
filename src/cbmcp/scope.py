@@ -126,11 +126,13 @@ class ScopeRule:
             raise ScopeViolation(
                 f"unknown scope mode {mode!r}", hint="Use 'off', 'warn' or 'enforce'."
             )
+        # A lease that names its own allowlist means it: enforce it unless the
+        # lease explicitly asked for "warn". (With an operator mode of "warn",
+        # scope_allow used to be advisory only, and redirects left the list.)
+        requested = mode or ("enforce" if new_allow else self.mode)
         # Operators can tighten, leases cannot loosen: not enforce -> warn, and
         # not warn -> off either (which would silence the operator's warnings).
-        effective_mode = max(
-            (mode or self.mode, self.mode), key=lambda m: _MODE_RANK.get(m, 0)
-        )
+        effective_mode = max((requested, self.mode), key=lambda m: _MODE_RANK.get(m, 0))
         if effective_mode == "off" and effective_allow:
             effective_mode = "enforce"
 

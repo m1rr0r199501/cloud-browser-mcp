@@ -143,6 +143,30 @@ CREATE TABLE IF NOT EXISTS slot_claims (
     created_at            REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_claims_instance ON slot_claims(instance_id);
+
+-- Named persistent browser profiles (cookies, logins, local storage), mapped
+-- to the provider's own profile id.
+CREATE TABLE IF NOT EXISTS profiles (
+    name                  TEXT NOT NULL,
+    provider              TEXT NOT NULL,
+    profile_id            TEXT NOT NULL,
+    created_at            REAL NOT NULL,
+    last_used_at          REAL,
+    PRIMARY KEY (name, provider)
+);
+
+-- One browser per profile at a time, across every gateway on this data dir:
+-- two browsers saving the same profile at once would overwrite each other's
+-- logins. A lock dies with its lease (released/failed lease row), so a crashed
+-- gateway cannot leave a profile locked for good -- except that it is kept
+-- until hold_until while the platform is still saving the stopped browser.
+CREATE TABLE IF NOT EXISTS profile_locks (
+    profile_id            TEXT PRIMARY KEY,
+    lease_id              TEXT NOT NULL,
+    instance_id           TEXT,
+    locked_at             REAL NOT NULL,
+    hold_until            REAL
+);
 """
 
 # Lease states. ACTIVE/CREATING/RELEASING/UNKNOWN all occupy a concurrency slot:
@@ -800,6 +824,110 @@ class Store:
                 continue
             live.add(r["instance_id"])
         return live
+
+    # ----- persistent profiles ---------------------------------------------
+
+    async def get_profile(self, name: str, provider: str) -> aiosqlite.Row | None:
+        cur = await self.db.execute(
+            "SELECT * FROM profiles WHERE name=? AND provider=?", (name, provider)
+        )
+        return await cur.fetchone()
+
+    async def add_profile(self, name: str, provider: str, profile_id: str) -> str:
+        """Record name -> profile_id; returns the id that won if two raced."""
+        await self.db.execute(
+            """INSERT INTO profiles (name, provider, profile_id, created_at)
+               VALUES (?,?,?,?) ON CONFLICT(name, provider) DO NOTHING""",
+            (name, provider, profile_id, time.time()),
+        )
+        row = await self.get_profile(name, provider)
+        return row["profile_id"] if row else profile_id
+
+    async def list_profiles(self, provider: str) -> list[aiosqlite.Row]:
+        cur = await self.db.execute(
+            """SELECT p.*, l.lease_id AS locked_by FROM profiles p
+               LEFT JOIN profile_locks l ON l.profile_id = p.profile_id
+               WHERE p.provider=? ORDER BY p.name""",
+            (provider,),
+        )
+        return list(await cur.fetchall())
+
+    async def delete_profile(self, name: str, provider: str) -> None:
+        await self.db.execute(
+            "DELETE FROM profiles WHERE name=? AND provider=?", (name, provider)
+        )
+
+    async def touch_profile(self, profile_id: str) -> None:
+        await self.db.execute(
+            "UPDATE profiles SET last_used_at=? WHERE profile_id=?", (time.time(), profile_id)
+        )
+
+    async def _clear_stale_profile_lock(self, profile_id: str, stale_after: float) -> None:
+        """Drop a lock whose lease has ended (or whose row is gone) and whose
+        save hold has passed, or that is older than ``stale_after`` seconds: by
+        then the platform's own hard timeout has stopped that browser whatever
+        happened to its gateway."""
+        marks = ",".join("?" * len(SLOT_STATES))
+        now = time.time()
+        await self.db.execute(
+            f"""DELETE FROM profile_locks WHERE profile_id=? AND (
+                    (lease_id NOT IN (SELECT lease_id FROM leases WHERE state IN ({marks}))
+                     AND COALESCE(hold_until, 0) <= ?)
+                    OR locked_at < ?)""",
+            (profile_id, *SLOT_STATES, now, now - stale_after),
+        )
+
+    async def hold_profile_lock(self, profile_id: str, lease_id: str, until: float) -> None:
+        """Keep a released lease's lock until ``until`` (the platform saving it)."""
+        await self.db.execute(
+            "UPDATE profile_locks SET hold_until=? WHERE profile_id=? AND lease_id=?",
+            (until, profile_id, lease_id),
+        )
+
+    async def profile_saving_until(self, profile_id: str) -> float | None:
+        """When a lock is held only for saving, the time that hold ends."""
+        marks = ",".join("?" * len(SLOT_STATES))
+        cur = await self.db.execute(
+            f"""SELECT hold_until FROM profile_locks WHERE profile_id=? AND hold_until > ?
+                AND lease_id NOT IN (SELECT lease_id FROM leases WHERE state IN ({marks}))""",
+            (profile_id, time.time(), *SLOT_STATES),
+        )
+        row = await cur.fetchone()
+        return float(row["hold_until"]) if row else None
+
+    async def lock_profile(
+        self, profile_id: str, lease_id: str, instance_id: str, *, stale_after: float
+    ) -> str | None:
+        """Lock a profile for one lease. Returns None on success, else the holder."""
+        await self._clear_stale_profile_lock(profile_id, stale_after)
+        await self.db.execute(
+            """INSERT INTO profile_locks (profile_id, lease_id, instance_id, locked_at)
+               VALUES (?,?,?,?) ON CONFLICT(profile_id) DO NOTHING""",
+            (profile_id, lease_id, instance_id, time.time()),
+        )
+        cur = await self.db.execute(
+            "SELECT lease_id FROM profile_locks WHERE profile_id=?", (profile_id,)
+        )
+        row = await cur.fetchone()
+        holder = row["lease_id"] if row else None
+        return None if holder == lease_id else (holder or "unknown")
+
+    async def unlock_profile(self, profile_id: str, lease_id: str) -> None:
+        await self.db.execute(
+            "DELETE FROM profile_locks WHERE profile_id=? AND lease_id=?", (profile_id, lease_id)
+        )
+
+    async def profile_lock_holder(self, profile_id: str, *, stale_after: float) -> str | None:
+        """The live lease holding a profile (a lock kept only for saving is not one)."""
+        await self._clear_stale_profile_lock(profile_id, stale_after)
+        marks = ",".join("?" * len(SLOT_STATES))
+        cur = await self.db.execute(
+            f"""SELECT lease_id FROM profile_locks WHERE profile_id=?
+                AND lease_id IN (SELECT lease_id FROM leases WHERE state IN ({marks}))""",
+            (profile_id, *SLOT_STATES),
+        )
+        row = await cur.fetchone()
+        return row["lease_id"] if row else None
 
     # ----- startup recovery ------------------------------------------------
 

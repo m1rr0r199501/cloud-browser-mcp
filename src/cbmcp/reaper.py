@@ -88,6 +88,7 @@ class Reaper:
             "reclaimed_idle": 0,
             "reclaimed_max_age": 0,
             "reclaimed_dead": 0,
+            "reconnected": 0,
             "reclaimed_platform_timeout": 0,
             "orphans_stopped": 0,
             "orphans_seen_other_instance": 0,
@@ -185,6 +186,12 @@ class Reaper:
                     "reclaimed_platform_timeout",
                 )
             elif not await self._is_alive(lease):
+                # The cloud browser usually outlives our connection to it (a Mac
+                # asleep, a network change). Try to get it back before giving up
+                # on the agent's browser and its task.
+                if await self.pool.reconnect(lease, why="liveness check"):
+                    self.stats["reconnected"] += 1
+                    continue
                 reason, key, stat = ("connection_lost", "dead", "reclaimed_dead")
 
             if reason is None:

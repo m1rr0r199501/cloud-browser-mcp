@@ -88,6 +88,34 @@ async def test_dead_connection_is_reclaimed(settings, store, pool):
     assert pool.provider.sessions["fake1"].status == "stopped"
 
 
+async def test_dropped_connection_to_a_running_browser_is_reconnected(settings, store, pool):
+    """Reported from real use: connection_lost reclaimed browsers that were
+    still running. The reaper now re-attaches before giving up on one."""
+    lease = await pool.acquire(AcquireRequest(task_label="flaky link"))
+    obj = pool.resolve_token(lease["lease"])
+    obj.session._alive = False
+    obj.session.reconnectable = True
+
+    reaper = _reaper(settings, store, pool)
+    outcome = await reaper.sweep()
+    assert outcome["dead"] == 0
+    assert reaper.stats["reconnected"] == 1
+    assert obj.session.reconnects == 1
+    assert pool.provider.sessions["fake1"].status == "active"
+    assert pool.resolve_token(lease["lease"]) is obj
+
+
+async def test_no_reconnect_once_the_cloud_session_has_stopped(settings, store, pool):
+    lease = await pool.acquire(AcquireRequest(task_label="gone"))
+    obj = pool.resolve_token(lease["lease"])
+    obj.session._alive = False
+    obj.session.reconnectable = True
+    pool.provider.sessions["fake1"].status = "stopped"
+
+    assert await pool.reconnect(obj, why="test") is False
+    assert obj.session.reconnects == 0
+
+
 async def test_lease_nearing_platform_timeout_is_reclaimed_first(settings, store, pool):
     lease = await pool.acquire(AcquireRequest(task_label="expiring"))
     obj = pool.resolve_token(lease["lease"])

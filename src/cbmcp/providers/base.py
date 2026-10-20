@@ -37,7 +37,13 @@ class NetworkSpec:
 
     def describe(self) -> str:
         if self.kind == "direct":
-            return "direct (platform datacenter IP, no proxy billing)"
+            # "direct" = no billed proxy, NOT a direct connection: measured on
+            # Browser Use, traffic still goes through the platform's own network
+            # (CDP sees a 10.x next hop and HTTP/1.1 only).
+            return (
+                "direct (no billed proxy; traffic still leaves through the platform's own "
+                "network -- browser_status(check_network=true) shows the egress IP)"
+            )
         if self.kind == "platform_proxy":
             return f"platform proxy ({self.country_code or 'default'}) -- billed per GB"
         if self.custom:
@@ -122,3 +128,12 @@ class Provider(Protocol):
     async def account_info(self) -> AccountInfo: ...
 
     async def aclose(self) -> None: ...
+
+
+@runtime_checkable
+class ProfileProvider(Protocol):
+    """Optional: providers that can keep browser state between sessions."""
+
+    async def create_profile(self, name: str) -> str: ...
+
+    async def delete_profile(self, profile_id: str) -> bool: ...

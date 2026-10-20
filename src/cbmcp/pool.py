@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import re
 import secrets
 import time
 from collections import OrderedDict
@@ -47,13 +48,15 @@ from .errors import (
     LeaseExpired,
     LeaseNotActive,
     LeaseNotFound,
+    NotFound,
+    ProfileInUse,
     ProviderConcurrencyLimit,
     ProviderError,
 )
 from .lease import Lease
 from .log import get_logger
 from .providers import network_spec_from_settings
-from .providers.base import Provider, SessionSpec
+from .providers.base import ProfileProvider, Provider, SessionSpec
 from .scope import ScopeRule, global_scope
 from .session import BrowserSession
 from .store import (
@@ -80,11 +83,18 @@ class AcquireRequest:
     scope_deny: list[str] | None = None
     scope_mode: str | None = None
     lease_seconds: float | None = None
+    # A named persistent profile (created on first use), or a raw provider
+    # profile id. acquire() resolves the name into profile_id.
+    profile: str | None = None
     profile_id: str | None = None
     debug: str | None = None
     screen_width: int | None = None
     screen_height: int | None = None
     solve_captchas: bool | None = None
+    # The profile came from CBMCP_DEFAULT_PROFILE rather than the caller: when
+    # it is busy the request gets a clean browser instead of an error.
+    profile_is_default: bool = False
+    profile_note: str | None = None
 
 
 @dataclass
@@ -123,6 +133,7 @@ class BrowserPool:
         self._slots_used = 0
         self._slot_lock = asyncio.Lock()
         self._pump_lock = asyncio.Lock()
+        self._profile_create_lock = asyncio.Lock()
         # Money committed by acquires that hold a slot but have not yet written
         # their reservation row. Guarded by _slot_lock.
         self._pending_reserve = 0.0
@@ -229,6 +240,18 @@ class BrowserPool:
             gone = self._gone.get(token.strip())
             if gone is not None:
                 self._explain_gone(*gone)
+            if token.strip().startswith("lse_"):
+                # Reported from real use: agents passed lease_id (shown in
+                # status views and audit) where the token belongs. The id is
+                # not a credential -- every window can see it -- so it is not
+                # accepted; say which value to pass instead.
+                raise InvalidArgument(
+                    f"{token.strip()!r} is a lease_id, not a lease token",
+                    hint=(
+                        "Pass the 'lease' value from browser_acquire (it starts with "
+                        "'lst_'), not 'lease_id' (which starts with 'lse_')."
+                    ),
+                )
             raise LeaseNotFound("unknown or expired lease token")
         return lease
 
@@ -342,6 +365,13 @@ class BrowserPool:
             self.s.platform_timeout_minutes, network, extra_outstanding=self._pending_reserve
         )
 
+        if await self._resolve_profile(request):
+            # Fail fast rather than after a queue wait. _fulfil takes the real
+            # (atomic) lock; this only catches the common case early.
+            holder = await self._profile_holder(request.profile_id or "")
+            if holder is not None:
+                self._profile_busy(request, holder)
+
         # The ticket id is redeemable for the lease token via
         # browser_queue_status, so it must be as unguessable as the token.
         ticket = Ticket(ticket_id="tkt_" + secrets.token_urlsafe(16), request=request)
@@ -369,6 +399,164 @@ class BrowserPool:
             self._tickets.pop(ticket.ticket_id, None)
             raise ticket.error
         return self._ticket_view(ticket)
+
+    # ----- persistent profiles --------------------------------------------
+
+    _PROFILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@-]{0,63}")
+
+    @property
+    def _profile_lock_stale_after(self) -> float:
+        # The platform's hard stop has ended any browser by then.
+        return self.s.platform_timeout_minutes * 60 + 300
+
+    async def _resolve_profile(self, request: AcquireRequest) -> str | None:
+        """Turn ``request.profile`` (a name) into a provider profile id."""
+        if request.profile and request.profile_id:
+            raise InvalidArgument(
+                "pass either profile (a name) or profile_id, not both",
+                hint="Use profile='name'; profile_id is only for a profile made elsewhere.",
+            )
+        if not request.profile and not request.profile_id and self.s.default_profile:
+            request.profile = self.s.default_profile
+            request.profile_is_default = True
+        if not request.profile:
+            return request.profile_id
+        name = request.profile.strip()
+        if not self._PROFILE_NAME.fullmatch(name):
+            raise InvalidArgument(
+                f"invalid profile name {request.profile!r}",
+                hint="1-64 characters: letters, digits, '.', '_', '-', '@'.",
+            )
+        request.profile = name
+        request.profile_id = await self.profile_id_for(name, create=True)
+        return request.profile_id
+
+    async def profile_id_for(self, name: str, *, create: bool) -> str | None:
+        row = await self.store.get_profile(name, self.provider.name)
+        if row is not None:
+            return str(row["profile_id"])
+        if not create:
+            return None
+        if not isinstance(self.provider, ProfileProvider):
+            raise InvalidArgument(f"the {self.provider.name} provider cannot keep profiles")
+        async with self._profile_create_lock:
+            row = await self.store.get_profile(name, self.provider.name)
+            if row is not None:
+                return str(row["profile_id"])
+            new_id = await self.provider.create_profile(name)
+            winner = await self.store.add_profile(name, self.provider.name, new_id)
+            if winner != new_id:
+                # Another window created the same name at the same moment.
+                with contextlib.suppress(Exception):
+                    await self.provider.delete_profile(new_id)
+            await self.store.audit("profile.create", outcome="ok", name=name)
+            log.info("profile %r created (%s)", name, winner)
+            return winner
+
+    async def _profile_holder(self, profile_id: str) -> str | None:
+        """The lease (or queued request) using a profile, if any."""
+        for lease in self._leases.values():
+            if lease.profile_id == profile_id and lease.state in (
+                ST_ACTIVE, ST_CREATING, ST_RELEASING, ST_UNKNOWN
+            ):
+                return lease.lease_id
+        for ticket in self._tickets.values():
+            if not ticket.settled and ticket.request.profile_id == profile_id:
+                return "a queued request"
+        return await self.store.profile_lock_holder(
+            profile_id, stale_after=self._profile_lock_stale_after
+        )
+
+    def _profile_busy(self, request: AcquireRequest, holder: str) -> None:
+        """Fall back to a clean browser for the default profile; else refuse."""
+        if request.profile_is_default:
+            request.profile_note = (
+                f"The default profile {request.profile!r} is in use by another browser, "
+                "so this one is a clean browser (no saved logins)."
+            )
+            request.profile = None
+            request.profile_id = None
+            request.profile_is_default = False
+            return
+        raise ProfileInUse(
+            f"profile {request.profile or request.profile_id!r} is in use by {holder}",
+            profile=request.profile,
+            held_by=holder,
+        )
+
+    async def _unlock_profile(self, lease: Lease) -> None:
+        if lease.profile_id:
+            with contextlib.suppress(Exception):
+                await self.store.unlock_profile(lease.profile_id, lease.lease_id)
+
+    def _profile_save_hold(self) -> float:
+        if getattr(self.provider, "saves_profile_after_stop", False):
+            return self.s.profile_save_seconds
+        return 0.0
+
+    async def _finish_profile(self, lease: Lease) -> float:
+        """The browser has stopped: free its profile once the platform has saved it.
+
+        Returns the seconds the profile stays locked for saving (0 = free now).
+        """
+        if not lease.profile_id:
+            return 0.0
+        hold = self._profile_save_hold()
+        if hold <= 0:
+            await self._unlock_profile(lease)
+            return 0.0
+        with contextlib.suppress(Exception):
+            await self.store.hold_profile_lock(
+                lease.profile_id, lease.lease_id, time.time() + hold
+            )
+        return hold
+
+    async def _wait_for_profile_save(self, profile_id: str) -> None:
+        """Let a just-stopped browser's profile save land before loading it."""
+        deadline = time.time() + self.s.profile_save_seconds + 5
+        while time.time() < deadline:
+            until = await self.store.profile_saving_until(profile_id)
+            if until is None:
+                return
+            await asyncio.sleep(min(2.0, max(0.2, until - time.time())))
+
+    async def create_profile(self, name: str) -> str:
+        request = AcquireRequest(profile=name)
+        await self._resolve_profile(request)
+        return request.profile or name
+
+    async def list_profiles(self) -> list[dict[str, Any]]:
+        out = []
+        for row in await self.store.list_profiles(self.provider.name):
+            holder = await self._profile_holder(row["profile_id"])
+            item: dict[str, Any] = {
+                "name": row["name"],
+                "in_use_by": holder,
+                "created_at": row["created_at"],
+                "last_used_at": row["last_used_at"],
+            }
+            saving = await self.store.profile_saving_until(row["profile_id"])
+            if saving and holder is None:
+                item["saving_for_seconds"] = round(saving - time.time(), 1)
+            out.append(item)
+        return out
+
+    async def delete_profile(self, name: str) -> dict[str, Any]:
+        profile_id = await self.profile_id_for(name, create=False)
+        if profile_id is None:
+            raise NotFound(f"no profile named {name!r}")
+        holder = await self._profile_holder(profile_id)
+        if holder is not None:
+            raise ProfileInUse(
+                f"profile {name!r} is in use by {holder}; release that browser first",
+                profile=name,
+                held_by=holder,
+            )
+        if isinstance(self.provider, ProfileProvider):
+            await self.provider.delete_profile(profile_id)
+        await self.store.delete_profile(name, self.provider.name)
+        await self.store.audit("profile.delete", outcome="ok", name=name)
+        return {"status": "deleted", "profile": name}
 
     async def _slots_elsewhere(self) -> int:
         """Slots held by other live gateways on this data dir (cached ~2s)."""
@@ -632,13 +820,45 @@ class BrowserPool:
                 network_mode=network.kind,
                 expires_at=lease.expires_at,
                 instance_id=self.s.instance_id,
-                meta={"scope_mode": scope.mode, "scope_deny": list(scope.deny)},
+                meta={
+                    "scope_mode": scope.mode,
+                    "scope_deny": list(scope.deny),
+                    "profile": request.profile,
+                },
             )
             await self.store.update_lease(lease_id, cost_reserved_usd=decision.reserve_usd)
             # The reservation is now durable, so the in-memory placeholder taken
             # alongside the slot can be dropped.
             await self._settle_pending_reserve(reserve_amount)
             pending_settled = True
+
+            # The real profile lock: one atomic statement across every gateway,
+            # taken after the lease row exists (a lock dies with its lease).
+            profile_id = request.profile_id
+            if profile_id:
+                await self._wait_for_profile_save(profile_id)
+                holder = await self.store.lock_profile(
+                    profile_id,
+                    lease_id,
+                    self.s.instance_id,
+                    stale_after=self._profile_lock_stale_after,
+                )
+                if holder is not None:
+                    fallback = AcquireRequest(
+                        profile=request.profile,
+                        profile_id=profile_id,
+                        profile_is_default=request.profile_is_default,
+                    )
+                    self._profile_busy(fallback, holder)  # raises unless default
+                    profile_id = None
+                    lease.profile_note = fallback.profile_note
+                else:
+                    lease.profile = request.profile
+                    lease.profile_id = profile_id
+                    with contextlib.suppress(Exception):
+                        await self.store.touch_profile(profile_id)
+            if lease.profile_note is None:
+                lease.profile_note = request.profile_note
 
             intent_id = await self.store.record_create_intent(
                 lease_id=lease_id, provider=self.provider.name, owner_tag=self.s.owner_tag
@@ -656,7 +876,7 @@ class BrowserPool:
                 ),
                 pdf_renderer_enabled=self.s.pdf_renderer_enabled,
                 enable_recording=self.s.enable_recording,
-                profile_id=request.profile_id,
+                profile_id=profile_id,
                 metadata={
                     "cbmcp_owner": self.s.owner_tag,
                     "cbmcp_instance": self.s.instance_id,
@@ -823,6 +1043,7 @@ class BrowserPool:
                     release_reason="create_failed",
                     released_at=time.time(),
                 )
+                await self._unlock_profile(lease)
                 await self.store.bump("acquire_failure")
                 await self.store.audit(
                     "lease.acquire",
@@ -928,6 +1149,14 @@ class BrowserPool:
         if lease.session is not None:
             info["pages"] = [h.id for h in lease.session.pages.values() if not h.closed]
             info["active_page"] = lease.session._active_page_id
+        if lease.profile_note:
+            info["profile_note"] = lease.profile_note
+        elif lease.profile:
+            info["profile_note"] = (
+                f"Profile {lease.profile!r}: cookies, logins and storage from earlier "
+                "browsers on this profile are loaded, and this browser's state is saved "
+                "back when you release it."
+            )
         info["next"] = (
             "Pass lease=<this token> to every page_*/net_*/js_* call. Call "
             "browser_release(lease) the moment you are done -- the cloud browser bills "
@@ -1022,8 +1251,13 @@ class BrowserPool:
         if lease.session is not None:
             # Bounded: the cloud stop below is what actually ends the billing, so
             # a wedged local teardown must never delay it.
+            shutdown = bool(
+                lease.profile_id and getattr(self.provider, "close_browser_before_stop", False)
+            )
             with contextlib.suppress(Exception):
-                await asyncio.wait_for(lease.session.aclose(), timeout=45)
+                await asyncio.wait_for(
+                    lease.session.aclose(shutdown_browser=shutdown), timeout=45
+                )
 
         stop_accepted = True
         confirmed = False
@@ -1110,7 +1344,11 @@ class BrowserPool:
         # The slot is only returned once the platform confirms the stop. An
         # unconfirmed session might still be running, and over-reporting free
         # capacity leads straight to platform 429s.
+        profile_hold = 0.0
         if confirmed:
+            # Likewise the profile: the platform saves it after the browser
+            # stops, so the next user must not start before that.
+            profile_hold = await self._finish_profile(lease)
             self._leases.pop(lease.lease_id, None)
             await self._free_slot()
         else:
@@ -1128,6 +1366,16 @@ class BrowserPool:
             "stop_confirmed": confirmed,
             "slots": f"{self._slots_used}/{self.effective_max}",
         }
+        if lease.profile:
+            result["profile"] = lease.profile
+            result["profile_note"] = (
+                f"Profile {lease.profile!r} is being saved by the platform (about "
+                f"{profile_hold:.0f}s); a browser acquired on it before then waits for that."
+                if profile_hold
+                else f"Profile {lease.profile!r} saved."
+                if confirmed
+                else f"Profile {lease.profile!r} stays locked until the stop is confirmed."
+            )
         if abandoned:
             result["abandoned_in_flight_calls"] = abandoned
         if net_stats:
@@ -1168,6 +1416,52 @@ class BrowserPool:
                 out["note"] = exc.message
             return out
         return await self.release(lease, reason=reason)
+
+    async def reconnect(self, lease: Lease, *, why: str) -> bool:
+        """Re-attach a lease to its still-running cloud browser.
+
+        Returns True if the lease is usable afterwards. Only a cloud session the
+        platform still reports as active is reconnected; a stopped one cannot
+        come back and the caller should release the lease.
+        """
+        if lease.session is None or not lease.platform_session_id or lease.state != ST_ACTIVE:
+            return False
+        async with lease.reconnect_lock:
+            if lease.state != ST_ACTIVE or lease.session is None:
+                return False
+            if lease.session.is_connected() and lease.session.liveness_failures == 0:
+                return True  # another caller already restored it
+            try:
+                remote = await self.provider.get_session(lease.platform_session_id)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("lease %s: cannot check its cloud session: %s", lease.lease_id, exc)
+                return False
+            if remote is None or remote.status != "active" or not remote.cdp_url:
+                log.warning(
+                    "lease %s: cloud session is %s; not reconnecting",
+                    lease.lease_id,
+                    remote.status if remote else "gone",
+                )
+                return False
+            try:
+                info = await lease.session.reconnect(remote.cdp_url)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("lease %s: reconnect failed: %s", lease.lease_id, exc)
+                await self.store.audit(
+                    "lease.reconnect", lease_id=lease.lease_id, outcome="failed",
+                    why=why, error=str(exc)[:200],
+                )
+                return False
+            # No lease.touch(): a reconnect is not agent activity, and an
+            # abandoned lease on a flaky link must still reach its idle timeout.
+            await self.store.bump("reconnects")
+            await self.store.audit(
+                "lease.reconnect", lease_id=lease.lease_id, outcome="ok", why=why,
+                reconnect_ms=info.get("reconnect_ms"),
+            )
+            log.info("lease %s reconnected (%s) in %sms", lease.lease_id, why,
+                     info.get("reconnect_ms"))
+            return True
 
     async def stop_all_now(self) -> int:
         """Send the platform stop for every live session at once.
@@ -1238,6 +1532,7 @@ class BrowserPool:
             return
         lease.state = ST_RELEASED
         await self.store.update_lease(lease_id, state=ST_RELEASED)
+        await self._finish_profile(lease)
         self._leases.pop(lease_id, None)
         await self._free_slot()
         log.info("lease %s confirmed stopped; slot returned", lease_id)

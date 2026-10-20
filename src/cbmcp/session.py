@@ -189,6 +189,8 @@ class BrowserSession:
         self._download_seq = 0
         # Tabs/popups opened by the page since the last tool call reported them.
         self._new_pages: list[str] = []
+        self._browser_cdp: Any | None = None
+        self.reconnects = 0
         self.liveness_failures = 0
         # Strong references to fire-and-forget tasks. The event loop only keeps
         # weak ones, so a task nobody holds can be collected mid-execution --
@@ -215,41 +217,9 @@ class BrowserSession:
         has a browser will waste a dozen tool calls finding out otherwise.
         """
         started = time.time()
-        try:
-            self.browser = await self._pw.chromium.connect_over_cdp(cdp_url, timeout=60_000)
-        except PwError as exc:
-            raise BrowserConnectionError(
-                f"could not open a CDP connection to the cloud browser: {_clean(exc)}"
-            ) from exc
-
-        contexts = self.browser.contexts
-        self.context = contexts[0] if contexts else await self.browser.new_context()
-        self.context.set_default_timeout(self.s.default_timeout_ms)
-        self.context.set_default_navigation_timeout(self.s.navigation_timeout_ms)
-
-        self.netlog.attach(self.context)
-        self.context.on("page", lambda page: self._spawn(self._adopt(page)))
-        if self.scope.mode == "enforce" and self.scope.restricted:
-            await self._install_scope_guard()
-
-        existing = list(self.context.pages)
-        if not existing:
-            existing = [await self.context.new_page()]
-        for page in existing:
-            await self._adopt(page)
-
-        # Liveness proof: the renderer must execute script and answer.
-        handle = self.active()
-        try:
-            async with asyncio.timeout(20):
-                value = await handle.page.evaluate("1+1")
-                title = await handle.page.title()
-        except (PwError, TimeoutError) as exc:
-            raise BrowserConnectionError(
-                f"the browser connected but is not responding: {_clean(exc)}"
-            ) from exc
-        if value != 2:
-            raise BrowserConnectionError("the browser returned an unexpected probe result")
+        self.browser = await self._open_cdp(cdp_url)
+        await self._attach()
+        handle, title = await self._prove_drivable()
 
         self.connected = True
         log.info(
@@ -266,6 +236,185 @@ class BrowserSession:
             "url": handle.page.url,
             "connect_ms": int((time.time() - started) * 1000),
         }
+
+    # Per-attempt CDP connect timeouts. Measured on Browser Use from a distant
+    # client: connects took 3-52s, and one in ten timed out at 60s on the first
+    # try while an immediate retry went through.
+    CONNECT_ATTEMPTS_MS = (40_000, 40_000, 40_000)
+
+    async def _open_cdp(self, cdp_url: str) -> Browser:
+        last: Exception | None = None
+        attempts = len(self.CONNECT_ATTEMPTS_MS)
+        for i, timeout in enumerate(self.CONNECT_ATTEMPTS_MS):
+            try:
+                return await self._pw.chromium.connect_over_cdp(cdp_url, timeout=timeout)
+            except PwError as exc:
+                last = exc
+                log.warning(
+                    "lease %s: CDP connect attempt %d/%d failed: %s",
+                    self.lease_id,
+                    i + 1,
+                    attempts,
+                    _clean(exc),
+                )
+                if i < attempts - 1:
+                    await asyncio.sleep(2.0 * (i + 1))
+        raise BrowserConnectionError(
+            f"could not open a CDP connection to the cloud browser after {attempts} "
+            f"attempts: {_clean(last)}"
+        )
+
+    async def _attach(self, previous: list[tuple[str, str]] | None = None) -> None:
+        """Take over the browser's context and pages on a fresh connection.
+
+        ``previous`` is [(page_id, url), ...] from before a reconnect: a page at
+        the same URL gets its old id back, so an agent's ``page='p2'`` still
+        means the same tab.
+        """
+        assert self.browser is not None
+        contexts = self.browser.contexts
+        self.context = contexts[0] if contexts else await self.browser.new_context()
+        self.context.set_default_timeout(self.s.default_timeout_ms)
+        self.context.set_default_navigation_timeout(self.s.navigation_timeout_ms)
+
+        self.netlog.attach(self.context)
+        self.context.on("page", lambda page: self._spawn(self._adopt(page)))
+        if self.scope.mode == "enforce" and self.scope.restricted:
+            await self._install_scope_guard()
+
+        existing = list(self.context.pages)
+        if not existing:
+            existing = [await self.context.new_page()]
+        unused = list(previous or [])
+        for page in existing:
+            wanted = next((pid for pid, url in unused if url == page.url), None)
+            if wanted is not None:
+                unused = [(pid, url) for pid, url in unused if pid != wanted]
+            await self._adopt(page, page_id=wanted)
+
+    async def _prove_drivable(self) -> tuple[PageHandle, str]:
+        """The renderer must execute script and answer, not merely be connected."""
+        handle = self.active()
+        try:
+            async with asyncio.timeout(20):
+                value = await handle.page.evaluate("1+1")
+                title = await handle.page.title()
+        except (PwError, TimeoutError) as exc:
+            raise BrowserConnectionError(
+                f"the browser connected but is not responding: {_clean(exc)}"
+            ) from exc
+        if value != 2:
+            raise BrowserConnectionError("the browser returned an unexpected probe result")
+        return handle, title
+
+    def is_connected(self) -> bool:
+        return bool(self.browser is not None and self.connected and self.browser.is_connected())
+
+    async def reconnect(self, cdp_url: str) -> dict[str, Any]:
+        """Re-attach to the SAME cloud browser after the connection dropped.
+
+        The cloud browser keeps running when our websocket dies (a Mac going to
+        sleep, a network change, a blip on the platform side) -- its tabs,
+        cookies and logged-in state are all still there. Reported from real
+        use: four connection losses in four minutes, each costing the agent its
+        browser and its task. Reconnecting keeps both.
+
+        Lost and not restored: breakpoints, emulation overrides and anything
+        else that lived on the old CDP connection. Hooks and the scope guard are
+        re-installed.
+        """
+        started = time.time()
+        # Closed ones count too: a dropped connection makes Playwright report
+        # every tab as closed (measured: the tab came back as p2 instead of p1).
+        # A tab that really was closed is not in the browser any more, so it
+        # cannot match; still-open handles are preferred for duplicate URLs.
+        handles = sorted(self.pages.values(), key=lambda h: h.closed)
+        previous = [(h.id, h.page.url) for h in handles]
+        old_active = self._active_page_id
+        self.connected = False
+        for task in list(self._bg):
+            task.cancel()
+        self._bg.clear()
+        if self.browser is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(self.browser.close(), timeout=5)
+        self.browser = None
+        self.context = None
+        self._browser_cdp = None
+        self.pages = {}
+        self._active_page_id = None
+
+        self.browser = await self._open_cdp(cdp_url)
+        await self._attach(previous)
+        if old_active in self.pages and not self.pages[old_active].closed:
+            self._active_page_id = old_active
+        self._hook_init_script = None
+        if self.hooks.specs:
+            with contextlib.suppress(Exception):
+                await self.apply_hooks()
+        await self._prove_drivable()
+        self.connected = True
+        self.liveness_failures = 0
+        self.reconnects += 1
+        ms = int((time.time() - started) * 1000)
+        log.info("lease %s reconnected in %dms (pages=%d)", self.lease_id, ms, len(self.pages))
+        return {
+            "reconnect_ms": ms,
+            "pages": [h.id for h in self.pages.values() if not h.closed],
+            "active_page": self._active_page_id,
+            "not_restored": "breakpoints and emulation settings (set them again if needed)",
+        }
+
+    async def network_info(self) -> dict[str, Any]:
+        """How this browser really reaches the internet.
+
+        Reported from real use: in 'direct' mode CDP showed a private 10.x
+        server_ip and HTTP/1.1 only, because the platform routes traffic through
+        its own network. A trace page fetched BY the browser shows what sites
+        actually see. Runs in a temporary tab so the agent's page is untouched.
+        """
+        url = "https://www.cloudflare.com/cdn-cgi/trace"
+        ok, reason = self.scope.permits(url)
+        if not ok and self.scope.mode == "enforce":
+            return {"available": False, "reason": f"blocked by this lease's scope: {reason}"}
+        previous_active = self._active_page_id
+        handle = await self.new_page()
+        text = ""
+        try:
+            async with asyncio.timeout(20):
+                await handle.page.goto(url, wait_until="domcontentloaded")
+                text = await handle.page.evaluate("document.body.innerText")
+        except (PwError, TimeoutError) as exc:
+            return {"available": False, "reason": _clean(exc)}
+        finally:
+            with contextlib.suppress(Exception):
+                await self.close_page(handle.id)
+            if previous_active in self.pages and not self.pages[previous_active].closed:
+                self._active_page_id = previous_active
+        fields = dict(line.split("=", 1) for line in str(text).splitlines() if "=" in line)
+        return {
+            "available": True,
+            "egress_ip": fields.get("ip"),
+            "country": fields.get("loc"),
+            "http_protocol": fields.get("http"),
+            "tls": fields.get("tls"),
+            "edge": fields.get("colo"),
+            "measured_with": url,
+        }
+
+    async def _browser_responds(self) -> bool:
+        """Ask the browser itself, not a page: a busy page is not a dead browser."""
+        if self.browser is None:
+            return False
+        try:
+            if self._browser_cdp is None:
+                self._browser_cdp = await self.browser.new_browser_cdp_session()
+            async with asyncio.timeout(10):
+                await self._browser_cdp.send("Browser.getVersion")
+            return True
+        except Exception:  # noqa: BLE001
+            self._browser_cdp = None
+            return False
 
     async def _install_scope_guard(self) -> None:
         """Block out-of-scope requests at the request layer, not just on navigate.
@@ -290,12 +439,13 @@ class BrowserSession:
         await self.context.route("**/*", guard)
         log.info("scope guard active for lease %s: %s", self.lease_id, self.scope.describe())
 
-    async def _adopt(self, page: Page) -> PageHandle:
+    async def _adopt(self, page: Page, page_id: str | None = None) -> PageHandle:
         for handle in self.pages.values():
             if handle.page is page:
                 return handle
-        self._page_seq += 1
-        page_id = f"p{self._page_seq}"
+        if page_id is None or page_id in self.pages:
+            self._page_seq += 1
+            page_id = f"p{self._page_seq}"
         handle = PageHandle(page_id, page)
         self.pages[page_id] = handle
         if self._active_page_id is None:
@@ -575,7 +725,7 @@ class BrowserSession:
         if url.startswith("blob:"):
             try:
                 async with asyncio.timeout(60):
-                    result = await handle.page.evaluate(_READ_BLOB_JS, [url, 50 * 1024 * 1024])
+                    result = await handle.page.evaluate(_READ_URL_JS, [url, 50 * 1024 * 1024, False])
             except (PwError, TimeoutError) as exc:
                 raise _DownloadUnavailable(f"could not read the blob: {_clean(exc)}") from exc
             if not isinstance(result, dict) or result.get("error"):
@@ -588,13 +738,25 @@ class BrowserSession:
 
         if url.startswith(("http://", "https://")) and self.context is not None:
             self.scope.enforce(url)
+            # First from inside the cloud browser, so the site sees the same IP,
+            # cookies and TLS fingerprint as for the click that started it.
+            # (context.request would send it from the machine running this
+            # gateway -- the user's own IP.) Cross-origin files may be refused
+            # by CORS; only then fall back.
+            with contextlib.suppress(PwError, TimeoutError):
+                async with asyncio.timeout(120):
+                    result = await handle.page.evaluate(
+                        _READ_URL_JS, [url, 50 * 1024 * 1024, True]
+                    )
+                if isinstance(result, dict) and result.get("b64") is not None:
+                    return base64.b64decode(result["b64"]), "fetched_in_cloud_browser"
             try:
                 response = await self.context.request.get(url, timeout=120_000)
             except Exception as exc:  # noqa: BLE001
                 raise _DownloadUnavailable(f"re-fetch failed: {_clean(exc)}") from exc
             if not response.ok:
                 raise _DownloadUnavailable(f"re-fetch returned HTTP {response.status}")
-            return await response.body(), "refetch_with_cookies"
+            return await response.body(), "refetched_from_gateway_host_ip"
 
         raise _DownloadUnavailable(f"no way to retrieve a {url.split(':', 1)[0]}: download")
 
@@ -1384,6 +1546,11 @@ class BrowserSession:
             self.liveness_failures = 0
             return True
         except Exception:  # noqa: BLE001
+            # The page did not answer. If the browser itself still does, the
+            # page is busy (heavy script, long layout), not the connection dead.
+            if await self._browser_responds():
+                self.liveness_failures = 0
+                return True
             self.liveness_failures += 1
             if self.liveness_failures < self.LIVENESS_STRIKES:
                 log.debug(
@@ -1399,6 +1566,7 @@ class BrowserSession:
         return {
             "pages": len([h for h in self.pages.values() if not h.closed]),
             "active_page": self._active_page_id,
+            "reconnects": self.reconnects,
             "paused_pages": self.paused_pages(),
             "debug_mode": self.debug_mode,
             "network": self.netlog.stats(),
@@ -1408,13 +1576,17 @@ class BrowserSession:
             "js_errors": sum(len(h.errors) for h in self.pages.values()),
         }
 
-    async def aclose(self) -> None:
+    async def aclose(self, *, shutdown_browser: bool = False) -> None:
         """Drop the local connection. Stopping the cloud session is the pool's job.
 
         Every step is bounded. Teardown must not be able to hang, because the
         concurrency slot and the platform stop both wait behind it -- and a
         renderer paused at a breakpoint will hang a plain ``browser.close()``,
         which is exactly why the debugger is resumed first.
+
+        ``shutdown_browser`` asks the browser process itself to exit cleanly
+        (CDP ``Browser.close``), so it flushes cookies to a kept profile before
+        the provider stops it. Only for providers that want it (local Chrome).
         """
         for task in list(self._bg):
             task.cancel()
@@ -1428,6 +1600,11 @@ class BrowserSession:
                     await asyncio.wait_for(handle.cdp.detach(), timeout=5)
         with contextlib.suppress(Exception):
             await asyncio.wait_for(self.netlog.aclose(), timeout=10)
+        if shutdown_browser and self.browser is not None:
+            with contextlib.suppress(Exception):
+                cdp = self._browser_cdp or await self.browser.new_browser_cdp_session()
+                await asyncio.wait_for(cdp.send("Browser.close"), timeout=10)
+            self._browser_cdp = None
         if self.browser is not None:
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(self.browser.close(), timeout=15)
@@ -1585,11 +1762,13 @@ class _DownloadUnavailable(Exception):
     pass
 
 
-_READ_BLOB_JS = r"""
-async ([url, cap]) => {
+_READ_URL_JS = r"""
+async ([url, cap, withCredentials]) => {
   try {
-    const blob = await (await fetch(url)).blob();
-    if (blob.size > cap) return { error: 'blob is ' + blob.size + ' bytes, over the cap' };
+    const resp = await fetch(url, withCredentials ? { credentials: 'include' } : {});
+    if (!resp.ok) return { error: 'HTTP ' + resp.status };
+    const blob = await resp.blob();
+    if (blob.size > cap) return { error: 'file is ' + blob.size + ' bytes, over the cap' };
     const bytes = new Uint8Array(await blob.arrayBuffer());
     let bin = '';
     for (let i = 0; i < bytes.length; i += 0x8000) {

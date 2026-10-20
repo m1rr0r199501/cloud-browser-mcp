@@ -10,7 +10,8 @@ Its real jobs:
 Chromium is launched as a plain subprocess with ``--remote-debugging-port=0``;
 the real port is read from the ``DevTools listening on ws://...`` line Chromium
 prints on stderr. Each session gets a throwaway ``--user-data-dir``, which is
-what makes local sessions as isolated from each other as cloud ones.
+what makes local sessions as isolated from each other as cloud ones -- unless
+it names a profile, which is a kept ``--user-data-dir`` under the data dir.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ import tempfile
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from ..errors import ProviderError
 from ..log import get_logger
@@ -46,6 +48,7 @@ class _Local:
     metadata: dict[str, str] = field(default_factory=dict)
     stopped_at: float | None = None
     tasks: list[asyncio.Task] = field(default_factory=list)
+    persistent: bool = False
 
 
 _MAC_APPS = (
@@ -94,18 +97,39 @@ def _find_chromium() -> str:
 
 class LocalChromiumProvider:
     name = "local"
-    supports_profiles = False
+    supports_profiles = True
     supports_custom_proxy = True
+    # A profile is a user-data-dir here. Killing Chrome (terminate() is a hard
+    # kill on Windows) can lose cookies it has not flushed yet, so the pool
+    # closes the browser over CDP first when a profile is in use.
+    close_browser_before_stop = True
 
-    def __init__(self, *, headless: bool = True) -> None:
+    def __init__(self, *, headless: bool = True, profiles_dir: Path | None = None) -> None:
         self._headless = headless
         self._sessions: dict[str, _Local] = {}
         self._bg: set[asyncio.Task] = set()
         self._binary: str | None = None
+        self._profiles_dir = profiles_dir or Path(tempfile.gettempdir()) / "cbmcp-profiles"
 
     async def aclose(self) -> None:
         for sid in list(self._sessions):
             await self.stop_session(sid)
+
+    def _profile_dir(self, profile_id: str) -> Path:
+        if not re.fullmatch(r"lp_[0-9a-f]{16}", profile_id or ""):
+            raise ProviderError(f"not a local profile id: {profile_id!r}")
+        return self._profiles_dir / profile_id
+
+    async def create_profile(self, name: str) -> str:
+        profile_id = "lp_" + uuid.uuid4().hex[:16]
+        path = self._profile_dir(profile_id)
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "cbmcp-profile-name").write_text(name + "\n", "utf-8")
+        return profile_id
+
+    async def delete_profile(self, profile_id: str) -> bool:
+        await asyncio.to_thread(shutil.rmtree, self._profile_dir(profile_id), True)
+        return True
 
     async def create_session(self, spec: SessionSpec) -> ProviderSession:
         proxy = spec.network.custom if spec.network.kind == "custom_proxy" else None
@@ -120,7 +144,13 @@ class LocalChromiumProvider:
             )
         if self._binary is None:
             self._binary = await asyncio.to_thread(_find_chromium)
-        user_data_dir = tempfile.mkdtemp(prefix="cbmcp-chrome-")
+        persistent = bool(spec.profile_id)
+        if persistent:
+            profile_path = self._profile_dir(spec.profile_id or "")
+            profile_path.mkdir(parents=True, exist_ok=True)
+            user_data_dir = str(profile_path)
+        else:
+            user_data_dir = tempfile.mkdtemp(prefix="cbmcp-chrome-")
         args = [
             self._binary,
             "--remote-debugging-port=0",
@@ -151,7 +181,8 @@ class LocalChromiumProvider:
                 *args, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
             )
         except OSError as exc:
-            shutil.rmtree(user_data_dir, ignore_errors=True)
+            if not persistent:
+                shutil.rmtree(user_data_dir, ignore_errors=True)
             raise ProviderError(
                 f"could not launch local Chromium at {self._binary!r}: {exc.strerror or exc}",
                 hint="Set CBMCP_CHROMIUM_PATH to a Chrome/Chromium executable.",
@@ -162,7 +193,8 @@ class LocalChromiumProvider:
                 proc.kill()
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(proc.wait(), timeout=5.0)
-            shutil.rmtree(user_data_dir, ignore_errors=True)
+            if not persistent:
+                shutil.rmtree(user_data_dir, ignore_errors=True)
             raise ProviderError("local Chromium did not report a DevTools endpoint")
 
         sid = f"local_{uuid.uuid4().hex[:12]}"
@@ -175,6 +207,7 @@ class LocalChromiumProvider:
             started_at=now,
             timeout_at=now + spec.timeout_minutes * 60,
             metadata=dict(spec.metadata),
+            persistent=persistent,
         )
         self._sessions[sid] = entry
         # Enforce the platform-side hard timeout locally too, so reaper tests
@@ -257,6 +290,13 @@ class LocalChromiumProvider:
             if task is not current and not task.done():
                 task.cancel()
         proc = entry.process
+        if entry.persistent and proc.returncode is None:
+            # The pool asked Chrome to close (CDP Browser.close). Let it finish:
+            # cookies are written on a clean exit, and terminate() is a hard
+            # kill on Windows. Measured: localStorage survived a kill, cookies
+            # did not.
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(proc.wait(), timeout=10.0)
         if proc.returncode is None:
             with contextlib.suppress(ProcessLookupError):
                 proc.terminate()
@@ -267,7 +307,8 @@ class LocalChromiumProvider:
                     proc.kill()
                 with contextlib.suppress(Exception):
                     await asyncio.wait_for(proc.wait(), timeout=5.0)
-        shutil.rmtree(entry.user_data_dir, ignore_errors=True)
+        if not entry.persistent:
+            shutil.rmtree(entry.user_data_dir, ignore_errors=True)
         self._sessions.pop(session_id, None)
         log.info("local chromium session %s stopped", session_id)
         return True

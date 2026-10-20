@@ -35,7 +35,7 @@ def build_provider(settings: Settings) -> Provider:
             settings.browser_use_api_key, settings.browser_use_base_url
         )
     if settings.provider == "local":
-        return LocalChromiumProvider()
+        return LocalChromiumProvider(profiles_dir=settings.data_dir / "profiles")
     raise ConfigError(f"unknown provider {settings.provider!r}")
 
 

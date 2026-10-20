@@ -52,6 +52,16 @@ class FakeProvider:
         self._lag: dict[str, int] = {}
         self.created: list[SessionSpec] = []
         self.stopped: list[str] = []
+        self.profiles: dict[str, str] = {}  # id -> name
+
+    async def create_profile(self, name: str) -> str:
+        profile_id = f"prof{len(self.profiles) + 1}"
+        self.profiles[profile_id] = name
+        return profile_id
+
+    async def delete_profile(self, profile_id: str) -> bool:
+        self.profiles.pop(profile_id, None)
+        return True
 
     async def create_session(self, spec: SessionSpec) -> ProviderSession:
         if self.create_delay:
@@ -132,7 +142,13 @@ class StubSession:
         self.debug_mode = kwargs.get("debug_mode", "full")
         self.connected = False
         self.closed = False
+        self.shutdown_browser = False
         self._alive = True
+        # Whether a dropped connection can be re-established (the cloud
+        # browser is still running) or not.
+        self.reconnectable = False
+        self.reconnects = 0
+        self.liveness_failures = 0
         self.pages = {}
         self._active_page_id = "p1"
         StubSession.instances.append(self)
@@ -141,15 +157,27 @@ class StubSession:
         self.connected = True
         return {"pages": ["p1"], "active_page": "p1", "title": "stub", "connect_ms": 1}
 
+    def is_connected(self) -> bool:
+        return self.connected and self._alive
+
+    async def reconnect(self, cdp_url: str) -> dict[str, Any]:
+        if not self.reconnectable:
+            raise RuntimeError("cannot reach the browser")
+        self._alive = True
+        self.connected = True
+        self.reconnects += 1
+        return {"reconnect_ms": 1, "pages": ["p1"], "active_page": "p1"}
+
     async def alive(self) -> bool:
         return self._alive
 
     def stats(self) -> dict[str, Any]:
         return {"pages": 1, "network": {"entries": 0}, "hooks": {"records": 0}}
 
-    async def aclose(self) -> None:
+    async def aclose(self, *, shutdown_browser: bool = False) -> None:
         self.closed = True
         self.connected = False
+        self.shutdown_browser = shutdown_browser
 
 
 @pytest.fixture

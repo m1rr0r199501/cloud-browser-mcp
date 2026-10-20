@@ -55,6 +55,14 @@ class Lease:
     # The task creating this lease's browser, while state is "creating". A
     # release that arrives mid-creation waits on it instead of racing it.
     creation_task: asyncio.Task | None = field(default=None, repr=False)
+    # Named persistent profile and the provider's id for it; None = clean browser.
+    profile: str | None = None
+    profile_id: str | None = None
+    # Why a requested profile was not used (the default profile was busy).
+    profile_note: str | None = None
+    # One reconnect at a time per lease (the reaper and a tool call can both
+    # notice a dropped connection).
+    reconnect_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
     # ----- clocks ----------------------------------------------------------
@@ -165,6 +173,8 @@ class Lease:
             "cost_reserved_usd": round(self.cost_reserved_usd, 6),
             "release_reason": self.release_reason,
         }
+        if self.profile:
+            out["profile"] = self.profile
         if self.platform_timeout_at:
             out["platform_hard_stop_in_seconds"] = round(
                 max(0.0, self.platform_timeout_at - time.time()), 1

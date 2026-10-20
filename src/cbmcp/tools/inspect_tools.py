@@ -8,7 +8,7 @@ from mcp.server.mcpserver import Image, MCPServer
 from playwright.async_api import Error as PwError
 
 from ..app import get_app
-from ._common import clip, guarded, use_lease
+from ._common import clip, guarded, page_condition_flags, use_lease
 
 SNAPSHOT_DOC = """Structured snapshot of the page with stable element refs.
 
@@ -63,6 +63,7 @@ def register(mcp: MCPServer) -> None:
                 "ready_state": result.get("readyState"),
                 "node_count": result.get("nodes"),
                 **clip(lines, app.s.max_snapshot_chars, label="snapshot"),
+                **page_condition_flags(session, handle, url=result.get("url")),
             }
             if result.get("truncated"):
                 payload["node_limit_reached"] = True
@@ -118,6 +119,7 @@ def register(mcp: MCPServer) -> None:
                 "url": result.get("url"),
                 "title": result.get("title"),
                 **clip(result.get("text") or "", limit, offset=offset),
+                **page_condition_flags(session, handle, url=result.get("url")),
             }
 
     @mcp.tool(
@@ -161,6 +163,9 @@ def register(mcp: MCPServer) -> None:
                 "page": handle.id,
                 "url": handle.page.url,
                 **clip(html or "", limit, offset=offset, label="html"),
+                **page_condition_flags(
+                    session, handle, html=None if (ref or selector) else (html or "")
+                ),
             }
 
     @mcp.tool(
