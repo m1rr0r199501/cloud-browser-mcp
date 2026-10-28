@@ -211,7 +211,7 @@ use `cbmcp stop <id>` for anything else on the account.
 
 ## Tools
 
-50 tools in six groups. Set `CBMCP_ENABLE_DEBUGGER_TOOLS=false` or
+51 tools in six groups. Set `CBMCP_ENABLE_DEBUGGER_TOOLS=false` or
 `CBMCP_ENABLE_ADMIN_TOOLS=false` to trim the agent's tool list and context.
 
 **Lease (6)** · `browser_acquire` `browser_queue_status` `browser_release`
@@ -240,9 +240,9 @@ downloaded.
 **Network (6)** · `net_requests` `net_request` `net_body` `net_websocket`
 `net_har` `net_clear`
 
-**JavaScript (12)** · `js_scripts` `js_source` `js_search` `js_breakpoint`
+**JavaScript (13)** · `js_scripts` `js_source` `js_search` `js_breakpoint`
 `js_pause_state` `js_eval_frame` `js_step` `js_properties` `js_options`
-`js_hook` `js_hook_records` `js_export_bundle`
+`js_hook` `js_hook_records` `js_export_bundle` `js_recon`
 
 **Admin (3)** · `admin_stats` `admin_sessions` `admin_audit`
 
@@ -312,6 +312,31 @@ anything else.
 While execution is paused the renderer is blocked, so page tools refuse to run
 and say so. That is deliberate — the alternative is a tool call that hangs for
 its full timeout.
+
+---
+
+## Client-side API discovery with mock responses
+
+`js_recon` installs target-specific bootstrap stubs and response handling before
+page scripts run. It can supply a menu/permission tree so otherwise hidden SPA
+modules mount and construct more API requests, while keeping those client-side
+observations separate from genuine backend responses.
+
+- **L1:** exact-path JSON stubs take precedence in both modes.
+- **Forward / L2:** unmatched requests use the cloud browser's native transport;
+  only explicitly configured error fields and values are patched for the client.
+- **Offline / L3:** unmatched configured API paths receive an empty JSON success
+  body without sending that request to the backend.
+
+Install before navigation, check `js_recon(action="status")`, then page
+`js_recon(action="records")` for private capture-file references. The configuration
+is fixed for the lease; release and acquire a clean lease to change it. Reloads,
+new tabs and reconnects retain the configuration. Mock success is not evidence
+of backend authentication or authorization.
+
+See [the API recon guide](docs/api-recon.md) for the complete configuration,
+capture format and explicit cloud test. This is built into `python -m
+cbmcp.server`; no external launcher is required.
 
 ---
 
@@ -470,6 +495,7 @@ python scripts/usage_simulation.py          # realistic multi-window run, ~4 min
 python scripts/concurrency_test.py --agents 6 --max-concurrency 2
 python scripts/verify_new_tools.py          # initiator, text breakpoint, emulate, bundle
 python scripts/fingerprint_check.py         # how detectable the instrumentation is
+python scripts/recon_smoke.py --output /private/tmp/recon-smoke.json  # explicit paid cloud recon test
 ```
 
 ### The usage simulation

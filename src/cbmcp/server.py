@@ -75,6 +75,11 @@ To understand how a page builds a request (a signature, token or nonce):
 `js_breakpoint(kind='xhr')` to stop where a request is built, then
 `js_pause_state` and `js_eval_frame` to read local and closure variables.
 Page tools are blocked while execution is paused -- call `js_step` to continue.
+
+For client-side API recon, use `js_recon(action='install')` before navigation
+to configure exact bootstrap stubs, explicit JSON response patching or offline
+API fallback. Check its status after navigation, page its capture index, then
+release the lease. Mock responses do not demonstrate backend authentication.
 """
 
 

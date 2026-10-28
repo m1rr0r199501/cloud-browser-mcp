@@ -169,6 +169,7 @@ class BrowserSession:
             capture_bodies=settings.capture_bodies,
         )
         self.hooks = HookRegistry(namespace=namespace, binding=binding)
+        self.recon: Any | None = None
         self.hooks.use_binding = debug_mode == "full"
         self.connected = False
         self._artifact_seq = 0
@@ -354,16 +355,21 @@ class BrowserSession:
                 await self.apply_hooks()
         await self._prove_drivable()
         self.connected = True
+        if self.recon is not None:
+            await self.recon.attach(self)
         self.liveness_failures = 0
         self.reconnects += 1
         ms = int((time.time() - started) * 1000)
         log.info("lease %s reconnected in %dms (pages=%d)", self.lease_id, ms, len(self.pages))
-        return {
+        result = {
             "reconnect_ms": ms,
             "pages": [h.id for h in self.pages.values() if not h.closed],
             "active_page": self._active_page_id,
             "not_restored": "breakpoints and emulation settings (set them again if needed)",
         }
+        if self.recon is not None:
+            result["recon"] = {"restored_for_future_documents": True, "reload_required": True}
+        return result
 
     async def network_info(self) -> dict[str, Any]:
         """How this browser really reaches the internet.

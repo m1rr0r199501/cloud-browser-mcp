@@ -1,0 +1,104 @@
+{
+  "date": "2026-10-28",
+  "version": "0.2.0",
+  "offline": {
+    "command": "python -m pytest tests -q",
+    "passed": 110,
+    "duration_seconds": 31.29
+  },
+  "lint": {
+    "scope": [
+      "src/cbmcp/recon.py",
+      "src/cbmcp/tools/recon_tools.py",
+      "tests/test_recon.py",
+      "scripts/recon_smoke.py"
+    ],
+    "passed": true
+  },
+  "cloud": {
+    "provider": "Browser Use",
+    "controlled_fixture": true,
+    "external_https": "example.com",
+    "passed_checks": 44,
+    "checks": [
+      "forward: real cloud lease ready",
+      "forward: document-start installed",
+      "forward: before business script",
+      "forward: fetch L1 menu",
+      "forward: XHR JSON L1/events",
+      "forward: XHR text L1",
+      "forward: no upstream L1 request",
+      "forward: non-API still forwarded",
+      "forward: Request object body and L2 HTTP/JSON",
+      "forward: XHR JSON L2",
+      "forward: unconfigured JSON unchanged",
+      "forward: requests really reached fixture transport",
+      "forward: survives reload before startup",
+      "forward: marker present",
+      "reconnect: same cloud browser restored",
+      "reconnect: custom startup script runs once",
+      "new tab: startup mock inherited once",
+      "forward: capture not dropped",
+      "forward: raw file hashes match",
+      "forward: files private",
+      "forward: raw 401 retained separately from mock 200",
+      "forward: Request body preserved",
+      "real external HTTPS navigation",
+      "forward: records pagination",
+      "forward: changed config cannot leave stale scripts",
+      "forward: platform confirms stopped",
+      "offline: real cloud lease ready",
+      "offline: document-start installed",
+      "offline: before business script",
+      "offline: fetch L1 menu",
+      "offline: XHR JSON L1/events",
+      "offline: XHR text L1",
+      "offline: no upstream L1 request",
+      "offline: non-API still forwarded",
+      "offline: L3 list is empty array",
+      "offline: API requests not forwarded",
+      "offline: survives reload before startup",
+      "offline: marker present",
+      "offline: capture not dropped",
+      "offline: raw file hashes match",
+      "offline: files private",
+      "offline: records pagination",
+      "offline: changed config cannot leave stale scripts",
+      "offline: platform confirms stopped"
+    ],
+    "capture_counts": {
+      "forward": {
+        "records": 32,
+        "dropped": 0
+      },
+      "offline": {
+        "records": 16,
+        "dropped": 0
+      }
+    },
+    "duration_seconds": 72.6,
+    "all_test_sessions_confirmed_stopped": true,
+    "local_browser_launched": false
+  },
+  "stdio": {
+    "entrypoint": "python -m cbmcp.server",
+    "from_extracted_wheel": true,
+    "passed_checks": 4,
+    "checks": [
+      "actual MCP stdio initialize",
+      "extension and original tools visible together",
+      "original browser_status callable",
+      "extension enforces lease capability"
+    ],
+    "extra_cloud_sessions_created": 0
+  },
+  "wheel": {
+    "filename": "cbmcp-0.2.0-py3-none-any.whl",
+    "sha256": "16d07b722dc91690e086dfff8149eed697c4aa954279b3d4e25bc15e3dc606d6",
+    "native_runtime_and_preload_bytes_match_source": true
+  },
+  "credentials": {
+    "key_embedded_in_code_or_results": false,
+    "working_tree_scan_passed": true
+  }
+}
