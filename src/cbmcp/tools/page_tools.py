@@ -357,7 +357,7 @@ def register(mcp: MCPServer) -> None:
         """
         Args:
             lease: Lease token.
-            ref: Element ref from page_snapshot, e.g. 'e12'.
+            ref: Opaque control ref from the current page_snapshot, e.g. 'e3_7'.
             selector: CSS selector, used if ref is omitted.
             text: Visible text, used if ref and selector are omitted.
             page: Tab id. Defaults to the active tab.

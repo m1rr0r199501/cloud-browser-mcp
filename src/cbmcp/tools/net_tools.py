@@ -19,6 +19,8 @@ OBSERVABILITY_NOTE = (
     "other processes' traffic are not. Requests made before the recorder attached "
     "(i.e. before browser_acquire returned) are absent, and Service Worker or "
     "cross-process iframe traffic may be partial."
+    " Requests affected by js_recon network_rules carry source_kind and "
+    "network_intervention; a driver-fulfilled mock or injected error is not an upstream response."
 )
 
 REQUESTS_DOC = f"""List observed HTTP requests, newest first, with filters.
@@ -166,6 +168,7 @@ def register(mcp: MCPServer) -> None:
                 return {
                     "ok": False,
                     "error": "body_unavailable",
+                    **entry.provenance(),
                     "message": entry.body_error or "no body was captured for this request",
                     "request": entry.summary(),
                     "hint": (
@@ -177,6 +180,7 @@ def register(mcp: MCPServer) -> None:
             limit = min(max_chars or app.s.max_text_chars, app.s.max_text_chars * 2)
             meta = {
                 "ok": True,
+                **entry.provenance(),
                 "request_id": entry.id,
                 "url": entry.url,
                 "status": entry.status,
@@ -273,7 +277,8 @@ def register(mcp: MCPServer) -> None:
         description=(
             "Export everything captured to a HAR 1.2 file on the gateway host, so "
             "it can be opened in existing HTTP tooling. WebSocket frames are "
-            "included under a _websockets extension."
+            "included under a _websockets extension. Selected-request simulations "
+            "are marked per entry with _sourceKind and _networkIntervention."
         )
     )
     @guarded

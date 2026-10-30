@@ -1,0 +1,40 @@
+{
+  "version": "0.3.2",
+  "date": "2026-10-31",
+  "scope": "Controlled local/offline fixtures and an owned Browser Use cloud session; no business target or local Chromium",
+  "offline": {
+    "full_suite_passed": 182,
+    "final_frame_followup_passed": 9,
+    "followup_overlaps_full_suite": true,
+    "followup_includes_unreadable_legacy_reference_guard": true
+  },
+  "actual_stdio": {
+    "passed": true,
+    "checks": 8,
+    "tools": 52,
+    "rented_browser_sessions": 0
+  },
+  "controlled_cloud_frames": {
+    "passed": true,
+    "checks": 36,
+    "owned_sessions": 1,
+    "all_sessions_confirmed_stopped": true,
+    "cases": [
+      "main and child document refs do not collide",
+      "stable live-node identity across snapshots",
+      "cross-origin and nested iframe click/type affect only the intended document",
+      "directory pagination includes more than eight frames and blank frames",
+      "cloned attributes cause a refused ambiguous action until re-snapshot",
+      "navigation and full reload invalidate old document refs",
+      "actual fresh-CDP reconnect restores safe ref resolution"
+    ]
+  },
+  "reported_limits": [
+    "The final coordinate-space label and legacy unreadable-frame guard have offline followup coverage; the modern cloud paths are unchanged",
+    "Child-frame event listeners are not queried through the main-document debugger context",
+    "DOM interaction does not imply complete cross-process network/debugger coverage",
+    "State artifacts cover cookies and localStorage; they do not claim all browser memory/storage components"
+  ],
+  "secrets_or_signed_connection_urls_in_report": false,
+  "prepublication_cleanup": "Removed extra blank lines at EOF in three files; Python ASTs unchanged. No behavioral change or additional paid run."
+}

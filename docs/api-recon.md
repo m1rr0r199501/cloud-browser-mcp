@@ -64,6 +64,64 @@ navigate or reload after installation.
 | `cookies` | Optional current-lease mock cookies: `url` must be a configured exact origin; require `name` and string `value`; optional `secure`, `httpOnly`, `sameSite`. Use a clean lease instead of modifying an unrelated kept profile. |
 | `block_login_paths` | Same-origin login path prefixes. Wraps history navigation and attempts Location methods. Chromium may make Location methods unmodifiable; page status reports that limitation. It does not guarantee suppression of every full-page redirect. |
 | `init_script` | Optional analyst-authored, target-specific JavaScript, executed in the same init script after the common shim, before business scripts on configured origins. Useful for client checks not covered by generic rules. It runs once per document, including after reconnect; check `custom_done` or `custom_init_failed` in page status. |
+| `network_rules` | Optional selected-request driver faults/delays. Exact `path`, optional `method`, and exactly one of `error` or `delay_ms`; see below. Only fetch/XHR from a configured page origin to a configured request origin; the first matching rule wins. |
+
+### Selected-request failures and delays
+
+Use when observing a retry, fallback, refresh or other client branch is useful.
+Install before navigation through the same `js_recon` tool:
+
+```json
+{
+  "origins": ["https://target.example"],
+  "mode": "forward",
+  "stubs": [{"path":"/api/slow","body":{"data":"loaded"}}],
+  "network_rules": [
+    {"path":"/api/offline","method":"GET","error":"internetdisconnected"},
+    {"path":"/api/slow","method":"GET","delay_ms":3000}
+  ]
+}
+```
+
+Paths/data are examples, not a site-independent recipe. Supported driver abort
+codes are `connectionrefused`, `timedout`, `connectionreset` and
+`internetdisconnected`. They are actual browser request aborts, not HTTP500 or
+a JavaScript-only rejected Promise. XHR may dispatch `timeout` for a network
+timeout; inspect the actual event and network error. Delay is an integer
+0..120000 milliseconds (a tool limit, not a research stopping rule); it is
+cancelled if the lease ends. End-to-end latency can be longer than that wait.
+
+An error overrides L1/L2/L3 and does not send that selected request. A delay
+waits, then preserves the ordinary result: L1 still supplies its configured
+JSON; offline API L3 stays synthetic; otherwise the browser forwards and the
+original L2 patching still applies. A delay rule supplies no body of its own:
+the three-second example puts the response in a same-path L1 stub. The shim
+allows these selected requests to reach the driver so L1/L3 cannot swallow the
+effect. Unmatched requests retain the existing path, including scope checks.
+
+Only pathname is matched: no query/fragment, no wildcard, and a missing method
+means all methods. The first matching rule wins. Document navigation, WebSocket
+and other resource types are not included. Service Workers or uninstrumented
+frames/realms can bypass this method; no applied record means no claim of
+coverage. `page_emulate(network="offline"/slow presets)` remains the separate
+whole-tab network-condition tool.
+
+Status reports rule count/transport and pending interventions, not proof a rule
+has run. Capture rows/files record `network_intervention` with rule index,
+config hash, requested error/wait, state and elapsed time. An intervention file
+is always `mock_runtime`; it never fabricates an upstream response. A real
+forward response after a delay is captured separately as `target_runtime`.
+Driver-fulfilled L1/L3 responses also appear in network tools, visibly marked
+`source_kind="mock_runtime"`. `net_request`/`net_body` retain this provenance;
+HAR uses `_sourceKind` and `_networkIntervention` per entry. Preserve these
+fields when importing; an HTTP200 in the network panel is not sufficient to
+identify a genuine upstream response.
+
+Keep the normal comparison, config/script resources and actual observed client
+branch. `cancelled`/`failed` is not `applied`. Release cancels outstanding delays
+and removes this lease's handler; reconnect reattaches it for future requests.
+Reload and verify actual behavior after reconnect. Configuration changes still
+require saving material and obtaining a clean lease.
 
 Configuration is immutable for a lease. Reinstalling identical configuration is
 idempotent; changing it returns an error. Save captures, release the browser,
@@ -118,6 +176,7 @@ The explicit cloud smoke test prompts for the key with terminal echo disabled:
 ```sh
 python scripts/recon_smoke.py --output /private/tmp/recon-smoke.json
 python scripts/recon_smoke.py --stdio-only --output /private/tmp/recon-stdio.json
+python scripts/recon_smoke.py --network-rules-only --output /private/tmp/network-rules.json
 ```
 
 The first uses the real cloud gateway/tools with a controlled fixture served

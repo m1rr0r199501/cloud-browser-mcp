@@ -12,7 +12,7 @@ from ._common import guarded, use_lease
 
 def register(mcp):
     @mcp.tool(
-        description="Install per-lease document-start API recon mock, inspect status or page its capture index. L1 exact stubs win; L2 explicitly configured real-response patching; L3 offline API fallback. Keeps raw upstream and mock files separate. Install before navigation; configuration is immutable until browser_release. Does not authenticate to the backend."
+        description="Install per-lease document-start API recon mock, inspect status or page its capture index. Optional network_rules target an exact pathname/method on configured page/request origins: browser-driver connectionrefused/timedout/connectionreset/internetdisconnected, or delay_ms before the normal L1/L2/L3/forward outcome. Errors precede all mocks; delays preserve the original outcome. Fetch/XHR only; query is excluded, first matching rule wins. Keeps upstream and simulation files separate. Install before navigation; configuration is immutable until browser_release. Does not authenticate to the backend."
     )
     @guarded
     async def js_recon(
@@ -27,7 +27,9 @@ def register(mcp):
             lease: Capability token from browser_acquire, not the lease_id label.
             action: install before navigation, status after navigation, or records.
             config: Required for install: exact origins, forward/offline mode and
-                target-specific stubs/neutralize rules. See docs/api-recon.md.
+                target-specific stubs/neutralize and optional network_rules.
+                Network rule: path, optional method, exactly one of error or
+                delay_ms (integer 0..120000). See docs/api-recon.md.
                 Same config is idempotent; changes require a clean lease.
             offset: Zero-based capture-index offset; follow next_offset.
             limit: Capture-index page size, 1..50. Bodies stay in private files.

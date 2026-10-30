@@ -17,7 +17,9 @@ function installRecon(P) {
   const absolute = value => { try { return new URL(value, location.href); } catch (_) { return null; } };
   const eligible = u => u && C.origins.includes(u.origin);
   const prefix = (u, paths) => paths.some(p => u.pathname.startsWith(p));
-  const rule = (u, method) => {
+  const networkRule = (u, method) => eligible(u) && (C.network_rules || []).find(s =>
+    s.path === u.pathname && (!s.method || s.method.toUpperCase() === method));
+  const responseRule = (u, method) => {
     if (!eligible(u)) return null;
     const exact = C.stubs.find(s => s.path === u.pathname && (!s.method || s.method.toUpperCase() === method));
     if (exact) return {...exact, layer: 'L1'};
@@ -27,6 +29,12 @@ function installRecon(P) {
       return {body, status: 200, layer: 'L3'};
     }
     return null;
+  };
+  // A selected request must reach the driver, even when L1/L3 would normally consume it.
+  const rule = (u, method) => networkRule(u, method) ? null : responseRule(u, method);
+  const driverMock = (u, method) => {
+    const n = networkRule(u, method);
+    return n && (n.error || responseRule(u, method));
   };
   const patch = (u, text) => {
     const n = C.neutralize;
@@ -93,6 +101,7 @@ function installRecon(P) {
       try { body = clip(await req.clone().text()); } catch (_) { body = {unavailable: true}; }
     }
     const request = {url: u.href, method, headers: headers(init && init.headers || req && req.headers), body};
+    const driverSynthetic = driverMock(u, method);
     const mock = rule(u, method);
     if (mock) {
       const text = JSON.stringify(mock.body);
@@ -105,10 +114,12 @@ function installRecon(P) {
     let response;
     try { response = await rawFetch.apply(this, arguments); }
     catch (error) {
-      emit({transport: 'fetch', layer: 'forward_error', request, request_sent: null,
+      if (!driverSynthetic) emit({transport: 'fetch', layer: 'forward_error', request, request_sent: null,
         error: clip(error.message), backend_verified: false});
       throw error;
     }
+    // The driver records its own abort/stub; do not label a fulfilled mock as an upstream response.
+    if (driverSynthetic) return response;
     let text;
     try { text = await response.clone().text(); }
     catch (_) { text = null; }
@@ -145,7 +156,7 @@ function installRecon(P) {
       Object.defineProperty(this,'__cbmcpReconObserved',{value:true});
       this.addEventListener('readystatechange', () => {
         const current = state.get(this);
-        if (!current || current.synthetic || current.recorded || native(this,'readyState') !== 4 || !eligible(current.url)) return;
+        if (!current || current.synthetic || current.driverMock || current.recorded || native(this,'readyState') !== 4 || !eligible(current.url)) return;
         current.recorded = true;
         let text = null;
         const json = this.responseType === 'json';
@@ -178,6 +189,7 @@ function installRecon(P) {
     const s = state.get(this);
     if (!s || !eligible(s.url)) return raw.send.apply(this,arguments);
     s.request = {url:s.url.href,method:s.method,headers:s.headers,body:preview(body)};
+    s.driverMock = !!driverMock(s.url, s.method);
     const mock = rule(s.url,s.method);
     if (!mock) return raw.send.apply(this,arguments);
     s.synthetic = true;

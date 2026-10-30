@@ -12,8 +12,9 @@ from ._common import clip, guarded, page_condition_flags, use_lease
 
 SNAPSHOT_DOC = """Structured snapshot of the page with stable element refs.
 
-This is the main way to see a page. Each interactive element gets a [ref=eN]
-you pass to page_click / page_type / page_select. Prefer it over a screenshot:
+This is the main way to see a page. Each interactive element gets an opaque ref
+such as [ref=e3_7], unique to its live document. Keep it unchanged when passing
+it to page_click / page_type / page_select. Prefer it over a screenshot:
 it is far cheaper in context and gives you refs you can act on.
 
 For security work it deliberately includes things a visual or accessibility
@@ -23,6 +24,12 @@ state), form action/method/enctype, and field name/type/pattern attributes.
 Pass `ref` to get a full dump of one element instead -- every attribute, its
 form context with sibling field values, and (with debug='full') the JavaScript
 event listeners bound to it with their source locations.
+
+Use frames_only=true for a lightweight child-frame directory. Follow
+next_frame_offset with frame_offset; totals, empty/failed frames and omitted
+counts are explicit. Use a returned frame_ref (the iframe element ref) to read
+one iframe's document, including cross-origin frames reachable by the driver.
+Refs inside that document work with the same page_click/page_type tools.
 """
 
 
@@ -35,6 +42,10 @@ def register(mcp: MCPServer) -> None:
         ref: str | None = None,
         include_hidden: bool = False,
         max_nodes: int = 1500,
+        frame_ref: str | None = None,
+        frames_only: bool = False,
+        frame_offset: int = 0,
+        frame_limit: int = 8,
     ) -> dict[str, Any]:
         """
         Args:
@@ -44,15 +55,26 @@ def register(mcp: MCPServer) -> None:
             include_hidden: Include elements that are not visible (form fields
                 are always included regardless).
             max_nodes: Cap on nodes in the output.
+            frame_ref: Iframe/frame element ref from this page's snapshot/directory;
+                inspect that document instead of the main document. Not a tab id.
+            frames_only: Return only the child-frame directory, without DOM bodies.
+            frame_offset: Child-frame directory item offset; follow next_frame_offset.
+            frame_limit: Child frames per response,1..50 (default8). Does not increase
+                the per-call text budget; inspect an individual frame for detail.
         """
         app = get_app()
         async with use_lease(lease) as (obj, session):
             handle = session.handle(page)
             if ref:
+                if frame_ref or frames_only or frame_offset:
+                    from ..errors import InvalidArgument
+                    raise InvalidArgument('Use ref for one control OR frame_ref/directory options for a frame snapshot.')
                 return {"ok": True, "page": handle.id, "element": await session.element_detail(handle, ref)}
 
             result = await session.snapshot(
-                handle, include_hidden=include_hidden, max_nodes=max_nodes
+                handle, include_hidden=include_hidden, max_nodes=max_nodes,
+                frame_ref=frame_ref, frames_only=frames_only,
+                frame_offset=frame_offset, frame_limit=frame_limit,
             )
             lines = result.pop("lines", "")
             payload: dict[str, Any] = {
@@ -63,27 +85,36 @@ def register(mcp: MCPServer) -> None:
                 "ready_state": result.get("readyState"),
                 "node_count": result.get("nodes"),
                 **clip(lines, app.s.max_snapshot_chars, label="snapshot"),
-                **page_condition_flags(session, handle, url=result.get("url")),
+                **(page_condition_flags(session, handle, url=result.get("url"))
+                   if result.get('root_frame_is_main') and not frames_only else {}),
             }
+            if payload.get('truncated'):
+                payload['hint'] = 'Snapshot text clipped; use frame_ref for the needed iframe or ref for one element. Text next_offset is not a page_snapshot input.'
             if result.get("truncated"):
                 payload["node_limit_reached"] = True
                 payload["hint"] = (
                     "Node limit reached. Raise max_nodes, or narrow the area of interest "
                     "with page_snapshot(ref=...) on a container."
                 )
-            frames = result.get("frames") or []
-            if frames:
-                payload["frames"] = [
-                    {
-                        "url": f["url"],
-                        "name": f.get("name"),
-                        **clip(f["lines"], 6000, label="snapshot"),
-                    }
-                    for f in frames[:8]
-                ]
-                payload["frame_note"] = (
-                    "Refs inside frames work with the same page_click/page_type calls."
-                )
+            for key in ('child_frame_total', 'frame_offset', 'next_frame_offset', 'has_more_frames',
+                        'frames_not_in_response', 'frame_directory_changed', 'directory_only',
+                        'root_frame_ref', 'root_frame_is_main'):
+                payload[key] = result.get(key)
+            payload['frames'] = []
+            remaining = app.s.max_snapshot_chars
+            for frame in result.get('frames', []):
+                row = {k:v for k,v in frame.items() if k not in {'lines','nodes','truncated'}}
+                if 'lines' in frame:
+                    row.update(clip(frame['lines'], min(6000, remaining), label='snapshot'))
+                    remaining = max(0, remaining - len(row['snapshot']))
+                    row['node_count'] = frame.get('nodes')
+                    if frame.get('truncated'):
+                        row['node_limit_reached'] = True
+                    if row.get('truncated') or row.get('node_limit_reached'):
+                        row['hint'] = 'Use page_snapshot(frame_ref=<this iframe ref>) for its document, then ref for a specific control; this is not complete frame content.'
+                payload['frames'].append(row)
+            payload['frame_errors_in_response'] = sum(f.get('status')=='error' or bool(f.get('frame_ref_error')) for f in payload['frames'])
+            payload['frame_note'] = 'frame_ref identifies the iframe element; ref identifies a control. Follow next_frame_offset for more children. Empty/error/truncated are not absence. Refs are document-scoped and must be refreshed after document replacement.'
             return payload
 
     @mcp.tool(

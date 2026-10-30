@@ -98,7 +98,7 @@ async def test_native_registration_exposes_recon_with_existing_tools(settings):
     register_all(server, settings)
     names = {tool.name for tool in await server.list_tools()}
     assert {"js_recon", "js_hook", "browser_acquire", "browser_release"} <= names
-    assert len(names) == 51
+    assert len(names) == 52
 
 
 async def test_disabling_javascript_group_also_hides_recon(settings):

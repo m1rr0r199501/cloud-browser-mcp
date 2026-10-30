@@ -36,6 +36,7 @@ import asyncio
 import base64
 import contextlib
 import json
+import re
 import time
 import urllib.parse
 from collections import deque
@@ -63,6 +64,7 @@ from .log import get_logger
 from .netlog import NetworkRecorder
 from .refs import (
     ELEMENT_DETAIL_JS,
+    FRAME_REF_JS,
     PAGE_INVENTORY_JS,
     PAGE_TEXT_JS,
     SNAPSHOT_JS,
@@ -159,6 +161,8 @@ class BrowserSession:
 
         # Per-lease random identifiers: no fixed signature for a page to match.
         self.ref_attr, self.ref_seq_key = new_ref_namespace()
+        self._ref_doc_seq = 0
+        self._ref_doc_frames: dict[str, Any] = {}
         namespace, binding = new_hook_namespace()
 
         self.netlog = NetworkRecorder(
@@ -333,6 +337,9 @@ class BrowserSession:
         previous = [(h.id, h.page.url) for h in handles]
         old_active = self._active_page_id
         self.connected = False
+        if self.recon is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(self.recon.detach(), timeout=5)
         for task in list(self._bg):
             task.cancel()
         self._bg.clear()
@@ -343,6 +350,7 @@ class BrowserSession:
         self.context = None
         self._browser_cdp = None
         self.pages = {}
+        self._ref_doc_frames.clear()
         self._active_page_id = None
 
         self.browser = await self._open_cdp(cdp_url)
@@ -886,21 +894,45 @@ class BrowserSession:
     # ----- element refs ----------------------------------------------------
 
     async def resolve_ref(self, handle: PageHandle, ref: str) -> Any:
-        """Find a ref in any frame of the page.
+        """Resolve in its actual document, refusing stale or ambiguous references."""
+        _, locator = await self._resolve_ref_frame(handle, ref)
+        return locator
 
-        Searching every frame costs one count() per frame and removes the need to
-        track which frame a ref came from, which would go stale anyway.
-        """
+    async def _resolve_ref_frame(self, handle: PageHandle, ref: str) -> tuple[Any, Any]:
         selector = ref_selector(ref, self.ref_attr)
-        frames = [
-            handle.page.main_frame,
-            *[f for f in handle.page.frames if f != handle.page.main_frame],
-        ]
+        frames = list(handle.page.frames)
+        match = re.fullmatch(r'e([1-9][0-9]*)_[1-9][0-9]*', ref)
+        prefix = match.group(1) if match else None
+        owners = getattr(self, '_ref_doc_frames', {})
+        known = owners.get(prefix) if prefix else None
+        if known is not None:
+            if known not in frames:
+                raise RefNotFound('The reference document was detached; take a fresh snapshot.')
+            frames = [known]
+        found = []
+        unreadable_legacy_frame = False
         for frame in frames:
-            with contextlib.suppress(PwError, PwTimeout):
-                locator = frame.locator(selector).first
-                if await locator.count() > 0:
-                    return locator
+            try:
+                if prefix:
+                    current = await frame.evaluate('key => window[key]?.prefix || null', self.ref_seq_key)
+                    if current != prefix:
+                        continue
+                locator = frame.locator(selector)
+                count = await locator.count()
+            except (PwError, PwTimeout):
+                if not prefix:
+                    unreadable_legacy_frame = True
+                continue
+            if count > 1 or (count and found):
+                raise RefNotFound('The reference is ambiguous; no element was selected. Take a fresh snapshot.')
+            if count:
+                found.append((frame, locator.first))
+        if found:
+            if unreadable_legacy_frame:
+                raise RefNotFound('Cannot establish a unique legacy reference while a frame is unreadable; take a fresh snapshot.')
+            if prefix:
+                self._remember_ref_frame(prefix, found[0][0])
+            return found[0]
         raise RefNotFound(f"element ref {ref!r} is not present on page {handle.id}")
 
     async def locator_for(
@@ -914,61 +946,132 @@ class BrowserSession:
             return handle.page.get_by_text(text, exact=False).first
         raise InvalidArgument(
             "pass ref, selector or text",
-            hint="Prefer ref from page_snapshot: it survives re-renders better than a CSS path.",
+            hint="Prefer the exact opaque ref from the current page_snapshot; refresh after document/node replacement.",
         )
 
     # ----- reads -----------------------------------------------------------
 
     def _snapshot_opts(self, **extra: Any) -> dict[str, Any]:
-        return {"refAttr": self.ref_attr, "seqKey": self.ref_seq_key, **extra}
+        self._ref_doc_seq = getattr(self, '_ref_doc_seq', 0) + 1
+        return {"refAttr": self.ref_attr, "seqKey": self.ref_seq_key,
+                "refPrefix": str(self._ref_doc_seq), **extra}
+
+    def _remember_ref_frame(self, prefix: str, frame: Any) -> None:
+        if not hasattr(self, '_ref_doc_frames'):
+            self._ref_doc_frames = {}
+        previous = self._ref_doc_frames.get(prefix)
+        if previous is not None and previous != frame and not previous.is_detached():
+            raise RefNotFound('Document reference namespace is ambiguous; no action was taken.')
+        self._ref_doc_frames[prefix] = frame
+
+    async def _frame_from_ref(self, handle: PageHandle, ref: str) -> Any:
+        _, locator = await self._resolve_ref_frame(handle, ref)
+        element = await locator.element_handle(timeout=10_000)
+        if element is None:
+            raise RefNotFound('The iframe element disappeared; take a fresh snapshot.')
+        try:
+            frame = await element.content_frame()
+        finally:
+            await element.dispose()
+        if frame is None:
+            raise InvalidArgument('frame_ref must identify an iframe/frame element, not a control inside it.')
+        return frame
+
+    async def _frame_element_ref(self, frame: Any) -> str:
+        async with asyncio.timeout(10):
+            element = await frame.frame_element()
+            try:
+                value = await element.evaluate(FRAME_REF_JS, self._snapshot_opts())
+            finally:
+                await element.dispose()
+        self._remember_ref_frame(value['ref_prefix'], frame.parent_frame)
+        return value['ref']
+
+    @staticmethod
+    def _child_frames(page: Any, root: Any) -> list[Any]:
+        children = []
+        for frame in page.frames:
+            parent = frame.parent_frame
+            while parent is not None:
+                if parent == root:
+                    children.append(frame)
+                    break
+                parent = parent.parent_frame
+        return children
+
+    async def _snapshot_frame(self, frame: Any, *, include_hidden: bool, max_nodes: int,
+                              max_text: int, timeout: int) -> dict[str, Any]:
+        async with asyncio.timeout(timeout):
+            result = await frame.evaluate(SNAPSHOT_JS, self._snapshot_opts(
+                maxNodes=max_nodes, includeHidden=include_hidden, maxTextLen=max_text))
+        self._remember_ref_frame(result['ref_prefix'], frame)
+        return result
 
     async def snapshot(
-        self, handle: PageHandle, *, include_hidden: bool = False, max_nodes: int = 1500
+        self, handle: PageHandle, *, include_hidden: bool = False, max_nodes: int = 1500,
+        frame_ref: str | None = None, frames_only: bool = False,
+        frame_offset: int = 0, frame_limit: int = 8,
     ) -> dict[str, Any]:
         self.ensure_runnable(handle)
+        if type(frame_offset) is not int or frame_offset < 0 or type(frame_limit) is not int or not 1 <= frame_limit <= 50:
+            raise InvalidArgument('frame_offset must be nonnegative; frame_limit must be1..50')
+        if type(max_nodes) is not int or max_nodes < 1:
+            raise InvalidArgument('max_nodes must be positive')
+        root = await self._frame_from_ref(handle, frame_ref) if frame_ref else handle.page.main_frame
         try:
-            async with asyncio.timeout(30):
-                result = await handle.page.evaluate(
-                    SNAPSHOT_JS,
-                    self._snapshot_opts(
-                        maxNodes=max_nodes, includeHidden=include_hidden, maxTextLen=160
-                    ),
-                )
+            result = ({'url': root.url, 'lines': '', 'nodes': 0} if frames_only else
+                      await self._snapshot_frame(root, include_hidden=include_hidden,
+                                                 max_nodes=max_nodes, max_text=160, timeout=30))
         except (PwError, TimeoutError) as exc:
             raise ToolTimeout(f"snapshot failed: {_clean(exc)}") from exc
+        children = self._child_frames(handle.page, root)
+        selected = children[frame_offset:frame_offset + frame_limit]
+        semaphore = asyncio.Semaphore(4)
 
-        frames: list[dict[str, Any]] = []
-        for frame in handle.page.frames:
-            if frame == handle.page.main_frame:
-                continue
-            with contextlib.suppress(PwError, TimeoutError):
-                async with asyncio.timeout(10):
-                    sub = await frame.evaluate(
-                        SNAPSHOT_JS,
-                        self._snapshot_opts(
-                            maxNodes=300, includeHidden=include_hidden, maxTextLen=120
-                        ),
-                    )
-                if sub and sub.get("lines"):
-                    frames.append({"url": frame.url, "name": frame.name, "lines": sub["lines"]})
-        result["frames"] = frames
+        async def describe(index: int, frame: Any) -> dict:
+            async with semaphore:
+                row = {'index': index, 'url': frame.url, 'name': frame.name,
+                       'parent_url': frame.parent_frame.url if frame.parent_frame else None}
+                try:
+                    row['frame_ref'] = await self._frame_element_ref(frame)
+                except (PwError, TimeoutError, RefNotFound):
+                    row['frame_ref_error'] = 'iframe_element_unavailable'
+                if frames_only:
+                    row['status'] = 'directory'
+                else:
+                    try:
+                        sub = await self._snapshot_frame(frame, include_hidden=include_hidden,
+                                                         max_nodes=300, max_text=120, timeout=10)
+                        row.update(url=sub.get('url', frame.url), lines=sub.get('lines', ''),
+                                   nodes=sub.get('nodes', 0), truncated=sub.get('truncated', False),
+                                   status='ok' if sub.get('lines') else 'empty')
+                    except (PwError, TimeoutError, RefNotFound) as exc:
+                        row.update(status='error', error='frame_snapshot_failed', error_type=type(exc).__name__)
+                return row
+
+        result['frames'] = await asyncio.gather(*(describe(frame_offset + i, f) for i, f in enumerate(selected)))
+        end = frame_offset + len(selected)
+        result.update(child_frame_total=len(children), frame_offset=frame_offset,
+                      next_frame_offset=end if end < len(children) else None,
+                      has_more_frames=end < len(children), frames_not_in_response=len(children) - len(selected),
+                      frame_directory_changed=children != self._child_frames(handle.page, root),
+                      directory_only=frames_only, root_frame_ref=frame_ref,
+                      root_frame_is_main=root == handle.page.main_frame)
         result["page"] = handle.id
         return result
 
     async def element_detail(self, handle: PageHandle, ref: str) -> dict[str, Any]:
         self.ensure_runnable(handle)
-        detail = None
-        for frame in handle.page.frames:
-            with contextlib.suppress(PwError, TimeoutError):
-                detail = await frame.evaluate(
-                    ELEMENT_DETAIL_JS, {"ref": ref, "refAttr": self.ref_attr}
-                )
-            if detail:
-                break
+        frame, _ = await self._resolve_ref_frame(handle, ref)
+        detail = await frame.evaluate(ELEMENT_DETAIL_JS, {"ref": ref, "refAttr": self.ref_attr})
         if not detail:
             raise RefNotFound(f"element ref {ref!r} not found on page {handle.id}")
 
-        if handle.debugger is not None and handle.cdp is not None:
+        detail['frame_url'] = frame.url
+        detail['box_coordinate_space'] = 'page_viewport' if frame == handle.page.main_frame else 'frame_viewport'
+        if frame != handle.page.main_frame:
+            detail['event_listeners_note'] = 'Child-frame event listeners are not queried through the main-document debugger context.'
+        if frame == handle.page.main_frame and handle.debugger is not None and handle.cdp is not None:
             with contextlib.suppress(Exception):
                 evaluated = await handle.cdp.send(
                     "Runtime.evaluate",
@@ -1594,6 +1697,9 @@ class BrowserSession:
         (CDP ``Browser.close``), so it flushes cookies to a kept profile before
         the provider stops it. Only for providers that want it (local Chrome).
         """
+        if self.recon is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(self.recon.detach(), timeout=5)
         for task in list(self._bg):
             task.cancel()
         self._bg.clear()
@@ -1617,6 +1723,7 @@ class BrowserSession:
         self.connected = False
         self.browser = None
         self.context = None
+        self._ref_doc_frames.clear()
 
 
 ENVIRONMENT_JS = r"""

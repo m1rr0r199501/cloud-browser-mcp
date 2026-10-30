@@ -2,12 +2,11 @@
 
 Design notes
 ------------
-Refs are written into the DOM as an attribute and the counter lives on
-``window``, so a ref stays valid across snapshots for as long as the node lives.
-Resolving a ref is a plain attribute selector, which means it works identically
-in every frame, needs no bookkeeping on the Python side, and -- importantly --
-yields a Playwright *locator*, which auto-waits and retries. Handle-based refs
-would avoid touching the DOM but lose that reliability.
+Refs are written into the DOM. A per-document WeakMap keeps node identity,
+while a lease-wide service counter allocates each document a distinct prefix.
+Refs remain stable while the node/document lives, do not collide across frames,
+and are not copied onto a clone merely because it copied a DOM attribute.
+The owning frame is checked before returning an auto-waiting locator.
 
 **The attribute name and the counter key are randomised per lease.** A page that
 greps for ``data-cbref`` or ``data-playwright`` finds nothing, and a
@@ -31,10 +30,37 @@ import secrets
 
 
 def new_ref_namespace() -> tuple[str, str]:
-    """A per-lease (attribute name, window counter key) pair."""
+    """A per-lease (attribute name, window reference-state key) pair."""
     token = secrets.token_hex(5)
     return f"data-{token}", f"_{token}"
 
+
+REF_STATE_JS = r"""
+(opts) => {
+  let state = window[opts.seqKey];
+  if (!state || state.version !== 2 || !state.refs || typeof state.refs.get !== 'function') {
+    if (!opts.refPrefix) throw new Error('Missing document reference prefix');
+    state = {version: 2, prefix: String(opts.refPrefix), next: 0, refs: new WeakMap()};
+    Object.defineProperty(window, opts.seqKey, {
+      value: state, writable: true, enumerable: false, configurable: true
+    });
+  }
+  return {
+    prefix: state.prefix,
+    refOf(el) {
+      let ref = state.refs.get(el);
+      if (!ref) {
+        ref = 'e' + state.prefix + '_' + (++state.next);
+        state.refs.set(el, ref);
+      }
+      if (el.getAttribute(opts.refAttr) !== ref) el.setAttribute(opts.refAttr, ref);
+      return ref;
+    }
+  };
+}
+"""
+
+FRAME_REF_JS = "(el, opts) => { const refs = (" + REF_STATE_JS + ")(opts); return {ref: refs.refOf(el), ref_prefix: refs.prefix}; }"
 
 SNAPSHOT_JS = r"""
 (opts) => {
@@ -42,15 +68,7 @@ SNAPSHOT_JS = r"""
   const maxText = opts.maxTextLen || 160;
   const includeHidden = !!opts.includeHidden;
   const REF_ATTR = opts.refAttr;
-  const SEQ_KEY = opts.seqKey;
-
-  if (typeof window[SEQ_KEY] !== 'number') {
-    try {
-      Object.defineProperty(window, SEQ_KEY, {
-        value: 0, writable: true, enumerable: false, configurable: true,
-      });
-    } catch (e) { window[SEQ_KEY] = 0; }
-  }
+  const refs = (__REF_STATE__)(opts);
 
   const SKIP = new Set(['SCRIPT','STYLE','NOSCRIPT','TEMPLATE','HEAD','META','LINK','TITLE','SVG','PATH','DEFS','USE','SYMBOL']);
   const FIELD = new Set(['INPUT','SELECT','TEXTAREA','BUTTON']);
@@ -143,12 +161,7 @@ SNAPSHOT_JS = r"""
   }
 
   function refOf(el) {
-    let ref = el.getAttribute(REF_ATTR);
-    if (!ref) {
-      ref = 'e' + (++window[SEQ_KEY]);
-      try { el.setAttribute(REF_ATTR, ref); } catch (e) { return null; }
-    }
-    return ref;
+    return refs.refOf(el);
   }
 
   function attrBits(el) {
@@ -248,9 +261,10 @@ SNAPSHOT_JS = r"""
     lines: lines.join('\n'),
     nodes: emitted,
     truncated: truncated,
+    ref_prefix: refs.prefix,
   };
 }
-"""
+""".replace("__REF_STATE__", REF_STATE_JS)
 
 ELEMENT_DETAIL_JS = r"""
 (opts) => {

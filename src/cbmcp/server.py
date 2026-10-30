@@ -59,6 +59,12 @@ Rules that matter:
 * `browser_acquire(profile="name")` keeps cookies, logins and local storage
   between browsers: the state is saved when the browser is released and comes
   back the next time that profile is used. One browser per profile at a time.
+* `browser_state(action="export", origins=[...])` saves a private state file.
+  Use `action="import"` with its hash, the observed SSO origin and selected
+  account_key to merge SSO state into your current account-specific profile.
+  It preserves unrelated state and does not switch profiles or need another
+  browser. Different actual accounts use different profiles. `action="restore"`
+  remains for empty leases before navigation. Verify the target identity/role.
 * `error="browser_connection_lost"` is transient: the gateway reconnects to the
   same cloud browser on the next call, so retry the call. A `rate_limit_warning`
   means the site is throttling this browser -- slow down instead of retrying.
@@ -80,6 +86,14 @@ For client-side API recon, use `js_recon(action='install')` before navigation
 to configure exact bootstrap stubs, explicit JSON response patching or offline
 API fallback. Check its status after navigation, page its capture index, then
 release the lease. Mock responses do not demonstrate backend authentication.
+When exploring a client retry/fallback branch, the same config's `network_rules`
+can abort a selected fetch/XHR with a browser network error or delay its normal
+response. Save actual intervention state/provenance; rules are optional, not a
+required step for every page. See docs/api-recon.md for matching and limits.
+For iframe UI, `page_snapshot(frames_only=true)` gives a paged child-frame
+directory; use a returned `frame_ref` to inspect that document, then its opaque
+control refs with the ordinary actions. Refs are document-scoped; stale or
+ambiguous refs never select the first match. See docs/frames.md.
 """
 
 

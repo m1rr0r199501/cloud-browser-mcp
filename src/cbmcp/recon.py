@@ -7,10 +7,12 @@ Unmodified upstream responses and client mock observations have separate files.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import os
 import secrets
+import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -19,6 +21,8 @@ from .errors import InvalidArgument
 MAX_CONFIG = 128_000
 MAX_RECORDS = 1000
 MAX_EVENT = 1_200_000
+NETWORK_ERRORS = {"connectionrefused", "timedout", "connectionreset", "internetdisconnected"}
+MAX_DELAY_MS = 120_000
 
 
 def capture_envelope(event, material, kind, digest, page_url, ident):
@@ -42,7 +46,10 @@ def capture_envelope(event, material, kind, digest, page_url, ident):
         },
     }
     if event.get("error"):
-        result["failure"] = "fetch_failed"
+        result["failure"] = (event["error"].get("text") or "network_intervention_failed") if event.get("network_effect") else "fetch_failed"
+    result.update(source_kind=kind, backend_verified=False)
+    if event.get("network_effect"):
+        result["network_intervention"] = event["network_effect"]
     records = [{"tool": "net_request", "result": result}]
     if isinstance(text.get("text"), str):
         value = text["text"]
@@ -93,6 +100,7 @@ def validate_config(value, scope):
         "cookies",
         "block_login_paths",
         "init_script",
+        "network_rules",
     }
     if set(config) - allowed:
         raise InvalidArgument("unknown recon config field")
@@ -192,6 +200,23 @@ def validate_config(value, scope):
             raise InvalidArgument("mock cookie name/value must be strings")
     if not isinstance(config.get("init_script", ""), str):
         raise InvalidArgument("init_script must be Worker-authored JavaScript text")
+    rules = config.get("network_rules", [])
+    if not isinstance(rules, list) or len(rules) > 200:
+        raise InvalidArgument("network_rules must be an array of at most 200 rules")
+    for rule in rules:
+        if not isinstance(rule, dict) or set(rule) - {"path", "method", "error", "delay_ms"}:
+            raise InvalidArgument("network rule accepts path, method and error or delay_ms")
+        path = rule.get("path")
+        if not isinstance(path, str) or not path.startswith("/") or path.startswith("//") or "?" in path or "#" in path:
+            raise InvalidArgument("network rule path must be an exact pathname without query/fragment")
+        if "method" in rule and (not isinstance(rule["method"], str) or not rule["method"].isalpha()):
+            raise InvalidArgument("network rule method must be an HTTP method")
+        if ("error" in rule) == ("delay_ms" in rule):
+            raise InvalidArgument("network rule requires exactly one of error and delay_ms")
+        if "error" in rule and (not isinstance(rule["error"], str) or rule["error"] not in NETWORK_ERRORS):
+            raise InvalidArgument("unsupported network error")
+        if "delay_ms" in rule and (type(rule["delay_ms"]) is not int or not 0 <= rule["delay_ms"] <= MAX_DELAY_MS):
+            raise InvalidArgument("delay_ms must be an integer from 0 to 120000")
     return config
 
 
@@ -211,6 +236,117 @@ class Recon:
         self.context = None
         self.bytes_saved = 0
         self.byte_limit = min(session.s.lease_disk_quota_bytes // 4, 64 * 1024 * 1024)
+        self._route_handler = None
+        self._route_tasks = set()
+        self._closing = False
+
+    def network_plan(self, request):
+        """Selected page fetch/XHR only; never intercept navigation or SW requests."""
+        if request.resource_type not in {"fetch", "xhr"}:
+            return None
+        try:
+            frame_url = request.frame.url
+        except Exception:
+            return None
+        url = urlsplit(request.url)
+        frame = urlsplit(frame_url)
+        if any(f"{u.scheme}://{u.netloc}" not in self.config["origins"] for u in (url, frame)):
+            return None
+        for index, rule in enumerate(self.config.get("network_rules", [])):
+            if rule["path"] == url.path and (not rule.get("method") or rule["method"].upper() == request.method.upper()):
+                return {**rule, "rule_index": index}
+        return None
+
+    def response_rule(self, url, method):
+        """The same L1/L3 choice as the shim, after the selected network effect."""
+        path = urlsplit(url).path
+        for stub in self.config["stubs"]:
+            if stub["path"] == path and (not stub.get("method") or stub["method"].upper() == method.upper()):
+                return {**stub, "layer": "L1"}
+        if self.config["mode"] == "offline" and any(path.startswith(p) for p in self.config["api_prefixes"]):
+            import re
+
+            body = self.config.get("fallback_body", {"code": 0, "data": [] if re.search(r"/(list|search|query|page|all|tree|nodes|options)(/|$)", path, re.I) else {}})
+            return {"body": body, "status": 200, "layer": "L3"}
+        return None
+
+    async def _intercept(self, session, route):
+        request = route.request
+        plan = self.network_plan(request)
+        if plan is None:
+            await route.fallback()
+            return
+        # A later-registered route must not bypass the original scope guard.
+        allowed, reason = session.scope.permits(request.url)
+        if session.scope.mode == "enforce" and not allowed:
+            session.netlog.note_blocked(request.url, reason)
+            await route.abort("blockedbyclient")
+            return
+        task = asyncio.current_task()
+        self._route_tasks.add(task)
+        effect = {k: plan[k] for k in ("rule_index", "error", "delay_ms") if k in plan}
+        effect.update(config_hash=self.digest, state="pending")
+        synthetic = self.response_rule(request.url, request.method)
+        kind = "mock_runtime" if "error" in plan or synthetic else "target_runtime"
+        session.netlog.mark_intervention(request, effect, kind)
+        started = time.monotonic()
+        source = {"page": request.frame.page}
+        event = {"transport": "driver", "layer": "network_error" if "error" in plan else "network_delay",
+                 "page_url": request.frame.url, "request_sent": False if kind == "mock_runtime" else None,
+                 "request": {"url": request.url, "method": request.method, "headers": dict(request.headers), "body": {}},
+                 "backend_verified": False}
+        try:
+            try:
+                body = request.post_data
+                event["request"]["body"] = {"text": body[:65536] if body else None, "truncated": bool(body and len(body) > 65536)}
+            except Exception:
+                event["request"]["body"] = {"unavailable": True}
+            if plan.get("delay_ms"):
+                await asyncio.sleep(plan["delay_ms"] / 1000)
+            if self._closing:
+                raise asyncio.CancelledError()
+            if "error" in plan:
+                await route.abort(plan["error"])
+                event["error"] = {"text": plan["error"]}
+            elif synthetic:
+                text = json.dumps(synthetic["body"], ensure_ascii=False, separators=(",", ":"))
+                await route.fulfill(status=synthetic.get("status", 200), headers={"content-type": "application/json", **synthetic.get("headers", {})}, body=text)
+                event.update(layer=synthetic["layer"], response={"status": synthetic.get("status", 200), "body": {"text": text[:65536], "truncated": len(text) > 65536}})
+            else:
+                # Continue through earlier handlers (including scope/fixtures), not continue_ which skips them.
+                await route.fallback()
+            effect["state"] = "applied"
+        except asyncio.CancelledError:
+            effect["state"] = "cancelled"
+            with contextlib.suppress(Exception):
+                await route.abort("aborted")
+            raise
+        except Exception:
+            effect["state"] = "failed"
+            event["error"] = {"text": "network_intervention_failed"}
+            with contextlib.suppress(Exception):
+                await route.abort("aborted")
+        finally:
+            effect["elapsed_ms"] = round((time.monotonic() - started) * 1000)
+            event["network_effect"] = dict(effect)
+            session.netlog.mark_intervention(request, effect, kind)
+            self._route_tasks.discard(task)
+            # This file describes the intervention, never a made-up upstream response.
+            await self.ingest(source, event)
+
+    async def detach(self):
+        """Cancel pending delays before release/reconnect; remove only our route."""
+        self._closing = True
+        tasks = list(self._route_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        if self.context is not None and self._route_handler is not None:
+            with contextlib.suppress(Exception):
+                await self.context.unroute("**/*", self._route_handler)
+        self.context = None
+        self._route_handler = None
 
     async def ingest(self, source, event):
         async with self.lock:
@@ -238,6 +374,8 @@ class Recon:
                 "config_hash": self.digest,
                 "files": [],
             }
+            if event.get("network_effect"):
+                row["network_intervention"] = event["network_effect"]
             for kind, material in (
                 ("target_runtime", event.get("upstream")),
                 ("mock_runtime", {k: v for k, v in event.items() if k != "upstream"}),
@@ -272,6 +410,12 @@ class Recon:
         context = session.context
         if context is None:
             raise InvalidArgument("browser context is unavailable")
+        self._closing = False
+        if self.config.get("network_rules"):
+            async def intercept(route):
+                await self._intercept(session, route)
+            await context.route("**/*", intercept)
+            self._route_handler = intercept
         await context.expose_binding(self.binding, self.ingest)
         cookies = self.config.get("cookies", [])
         if cookies:
@@ -332,4 +476,7 @@ class Recon:
             "bytes_saved": self.bytes_saved,
             "capture_byte_limit": self.byte_limit,
             "mutable": False,
+            "network_rules": len(self.config.get("network_rules", [])),
+            "network_rules_transport": "browser_driver_fetch_xhr" if self.config.get("network_rules") else None,
+            "pending_network_interventions": len(self._route_tasks),
         }

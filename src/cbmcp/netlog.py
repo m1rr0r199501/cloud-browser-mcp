@@ -60,6 +60,7 @@ _INTERESTING_TYPES = {"xhr", "fetch", "document", "script", "websocket", "manife
 
 # Attribute used to tag a Playwright Request with its log entry id.
 _REQUEST_TAG = "_cbmcp_entry_id"
+_INTERVENTION_TAG = "_cbmcp_network_intervention"
 
 _SENSITIVE_HEADERS = {
     "authorization",
@@ -130,6 +131,14 @@ class NetEntry:
     redirected_from: str | None = None
     server_ip: str | None = None
     browser_error_page: bool = False
+    source_kind: str = "target_runtime"
+    network_intervention: dict[str, Any] | None = None
+
+    def provenance(self) -> dict[str, Any]:
+        if self.network_intervention is None:
+            return {}
+        return {"source_kind": self.source_kind, "network_intervention": self.network_intervention,
+                "backend_verified": False}
 
     @property
     def duration_ms(self) -> int | None:
@@ -153,6 +162,7 @@ class NetEntry:
         }
         if self.browser_error_page:
             out["browser_error_page"] = True
+        out.update(self.provenance())
         return out
 
     def detail(self, redact: bool) -> dict[str, Any]:
@@ -165,6 +175,7 @@ class NetEntry:
             }
 
         return {
+            **self.provenance(),
             "id": self.id,
             "method": self.method,
             "url": self.url,
@@ -359,6 +370,16 @@ class NetworkRecorder:
             entry_id = self._by_request.get(id(request))
         return self._entries.get(entry_id) if entry_id else None
 
+    def mark_intervention(self, request: Any, effect: dict, source_kind: str) -> None:
+        """Keep driver-generated failures/responses visibly separate from upstream."""
+        value = {"source_kind": source_kind, "network_intervention": dict(effect)}
+        with contextlib.suppress(Exception):
+            setattr(request, _INTERVENTION_TAG, value)
+        entry = self._entry_of(request)
+        if entry is not None:
+            entry.source_kind = source_kind
+            entry.network_intervention = dict(effect)
+
     def _on_request(self, request: Any) -> None:
         try:
             entry_id = self._next_id()
@@ -393,6 +414,10 @@ class NetworkRecorder:
                 post_data_truncated=truncated,
                 redirected_from=redirected_from,
             )
+            intervention = getattr(request, _INTERVENTION_TAG, None)
+            if intervention:
+                entry.source_kind = intervention["source_kind"]
+                entry.network_intervention = dict(intervention["network_intervention"])
             with contextlib.suppress(Exception):
                 frame = request.frame
                 entry.frame_url = frame.url if frame else None
@@ -816,6 +841,8 @@ class NetworkRecorder:
                     "timings": {"send": 0, "wait": entry.duration_ms or 0, "receive": 0},
                     "_resourceType": entry.resource_type,
                     "_failure": entry.failure,
+                    **({"_sourceKind": entry.source_kind, "_networkIntervention": entry.network_intervention}
+                       if entry.network_intervention is not None else {}),
                 }
             )
 

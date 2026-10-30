@@ -48,7 +48,7 @@ top of it.
 
 ## Install
 
-Requires Python 3.11+ and a Browser Use Cloud API key.
+Requires Python 3.11+, Playwright1.64.1+ and a Browser Use Cloud API key.
 
 ```bash
 cd cloud-browser-mcp
@@ -190,6 +190,14 @@ loaded, and this browser's state is saved back when it is released. Set
 `CBMCP_DEFAULT_PROFILE=main` to use it whenever an acquire names none.
 `browser_profiles` lists, creates and deletes profiles.
 
+For explicit Cookie/localStorage files, `browser_state` exports a scoped,
+private hashed artifact. Import a selected account's SSO origin into its own
+current profile with `action="import"`, the actual hash and account_key; other
+site state is preserved and no profile switch or extra lease is required.
+Different actual accounts use separate profiles. `action="restore"` remains
+for empty contexts before navigation. See [state files and reuse](docs/storage-state.md);
+all reuse still requires target-specific identity and role checks.
+
 One browser per profile at a time, across every Claude window on the machine
 (a lock in the shared database): two browsers saving one profile would
 overwrite each other's logins. An explicit `profile` that is busy fails with
@@ -211,7 +219,7 @@ use `cbmcp stop <id>` for anything else on the account.
 
 ## Tools
 
-51 tools in six groups. Set `CBMCP_ENABLE_DEBUGGER_TOOLS=false` or
+52 tools in seven groups. Set `CBMCP_ENABLE_DEBUGGER_TOOLS=false` or
 `CBMCP_ENABLE_ADMIN_TOOLS=false` to trim the agent's tool list and context.
 
 **Lease (6)** · `browser_acquire` `browser_queue_status` `browser_release`
@@ -240,6 +248,8 @@ downloaded.
 **Network (6)** · `net_requests` `net_request` `net_body` `net_websocket`
 `net_har` `net_clear`
 
+**Storage (1)** · `browser_state`
+
 **JavaScript (13)** · `js_scripts` `js_source` `js_search` `js_breakpoint`
 `js_pause_state` `js_eval_frame` `js_step` `js_properties` `js_options`
 `js_hook` `js_hook_records` `js_export_bundle` `js_recon`
@@ -253,6 +263,14 @@ to it for one element in full, including the **event listeners** bound to it wit
 their source locations — which is CDP-only information, unreachable from page JS.
 
 ---
+
+## Iframes and document references
+
+Iframe UI uses the same `page_snapshot`: `frames_only=true` returns a paged
+directory with totals/errors; a returned `frame_ref` selects that document.
+Use its opaque control refs with the ordinary click/type/select tools. Refs
+are document-scoped, stay stable on live nodes and reject stale/ambiguous
+matches. See [frame interaction and snapshot limits](docs/frames.md).
 
 ## The JavaScript debugging workflow
 
@@ -321,6 +339,14 @@ its full timeout.
 page scripts run. It can supply a menu/permission tree so otherwise hidden SPA
 modules mount and construct more API requests, while keeping those client-side
 observations separate from genuine backend responses.
+
+Optional `network_rules` in the same config can abort a selected fetch/XHR with
+a real browser network error or delay its ordinary response (for example,
+3000ms before an L1 JSON stub). Errors precede all three layers; delays preserve
+their normal response selection. Rules are exact pathname/optional method,
+and intervention provenance is retained in captures, network tools and HAR.
+This is useful for observing retry/fallback branches without changing unrelated
+requests; it is separate from `page_emulate` whole-tab offline/slow presets.
 
 - **L1:** exact-path JSON stubs take precedence in both modes.
 - **Forward / L2:** unmatched requests use the cloud browser's native transport;
@@ -581,7 +607,8 @@ unit tests, and are worth knowing about if you extend the hook runtime:
 - **No browser reuse between leases.** Considered and rejected: handing a used
   browser to another agent would carry cookies, storage and login state across,
   which breaks the isolation guarantee for a few cents of saved cold start.
-  State carries over only when a task asks for it, through a named profile.
+  State carries over only when a task asks for it, through a named profile or an
+  explicitly checked browser_state file restored into a clean context.
 - **`customProxy` is host/port/user/pass**; whether a given SOCKS5 endpoint works
   is the platform's behaviour, not something this gateway can determine. Test it
   with `CBMCP_NETWORK_MODE=custom_proxy` and `cbmcp check` before relying on it.
